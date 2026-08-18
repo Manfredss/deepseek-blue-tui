@@ -1,0 +1,51 @@
+name: Bug 报告
+description: 描述一个可复现的缺陷
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        报告前请先确认没有重复的 Issue，并注意：**不要**在 Issue 中粘贴 API Key、会话内容或其他敏感信息。
+  - type: input
+    id: version
+    attributes:
+      label: 版本
+      description: "`deepseek --version` 的输出"
+      placeholder: 0.1.0
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: 运行环境
+      description: 操作系统、终端模拟器、`node --version`
+      placeholder: macOS 15 · iTerm2 · Node 24.1.0
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: 复现步骤
+      description: 按顺序列出能稳定复现的操作
+      placeholder: "1. deepseek dsh install\n2. deepseek dsh start --port 3091\n3. ..."
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望行为
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际行为
+      description: 报错文本、截图（脱敏后）或日志尾部
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: 补充信息
+      description: `deepseek dsh logs`、`DEEPSEEK_TUI_HOME` 隔离目录复现结果等

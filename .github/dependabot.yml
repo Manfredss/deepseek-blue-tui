@@ -1,0 +1,17 @@
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    # DSH is installed explicitly by users at a pinned, verified version;
+    # do not let bot PRs churn the verified matrix. Review upgrades manually
+    # via the DSH compatibility notes in RESEARCH.md.
+    ignore:
+      - dependency-name: "@deepseek-ai/dsh"
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

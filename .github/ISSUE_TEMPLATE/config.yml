@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 安全漏洞
+    url: https://github.com/manfredss/deepseek-blue-tui/security/advisories/new
+    about: 请通过 Security Advisory 私下报告，不要开公开 Issue（见 SECURITY.md）
+  - name: 讨论与提问
+    url: https://github.com/manfredss/deepseek-blue-tui/discussions
+    about: 使用方式、想法交流请到 Discussions

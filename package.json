@@ -1,0 +1,56 @@
+{
+  "name": "deepseek-blue-tui",
+  "version": "0.1.0",
+  "description": "A fast, Claude-like terminal client for DeepSeek with session resume and managed DSH integration.",
+  "type": "module",
+  "bin": {
+    "deepseek": "dist/cli.js",
+    "dstui": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "RESEARCH.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx src/cli.ts",
+    "start": "node dist/cli.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --import tsx --test test/*.test.ts",
+    "check": "npm run typecheck && npm test",
+    "prepack": "npm run build"
+  },
+  "keywords": [
+    "deepseek",
+    "tui",
+    "cli",
+    "terminal",
+    "dsh",
+    "whale"
+  ],
+  "author": "Wenfei (Charles) Qi",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/manfredss/deepseek-blue-tui.git"
+  },
+  "homepage": "https://github.com/manfredss/deepseek-blue-tui#readme",
+  "bugs": {
+    "url": "https://github.com/manfredss/deepseek-blue-tui/issues"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.5.0",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2"
+  }
+}
