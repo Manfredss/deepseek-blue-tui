@@ -18,7 +18,7 @@ import { DeepSeekTui } from "./tui.js";
 import { createTheme } from "./theme.js";
 import { streamChat, getBalance, DeepSeekApiError } from "./api.js";
 import type { AppConfig, ChatMessage, Session } from "./types.js";
-import { LineInput, promptSecret } from "./input.js";
+import { MenuPicker, promptSecret } from "./input.js";
 import { DEEPSEEK_URLS, openUrl } from "./open-url.js";
 import { VERSION } from "./version.js";
 
@@ -162,16 +162,19 @@ async function standaloneLogin(store: ConfigStore, config: AppConfig): Promise<v
     throw new Error("非交互环境请设置 DEEPSEEK_API_KEY 环境变量");
   }
   const theme = createTheme(true);
-  const input = new LineInput();
-  process.stdout.write("1  安全粘贴 API Key\n2  打开 DeepSeek API Key 页面\n");
-  const choice = await input.next(theme.brightBlue("选择› "));
-  input.close();
-  if (choice?.trim() === "2") {
+  const result = await new MenuPicker(process.stdin, process.stdout).run({
+    title: "登录方式",
+    items: ["安全粘贴 API Key", "打开 DeepSeek API Key 页面", "取消"],
+    footer: "↑/↓ 选择 · Enter 确认 · Esc 取消 · 数字跳转",
+    color: { accent: theme.brightBlue, muted: theme.muted },
+  });
+  if (!result || result.kind !== "index") return;
+  if (result.index === 1) {
     const opened = await openUrl(DEEPSEEK_URLS.apiKeys);
     process.stdout.write(opened ? "已打开 API Key 页面。\n" : `${DEEPSEEK_URLS.apiKeys}\n`);
     return;
   }
-  if (choice?.trim() !== "1") return;
+  if (result.index !== 0) return;
   const key = await promptSecret("粘贴 API Key：");
   if (!key?.trim()) return;
   if (key.trim().length < 8 || /\s/.test(key.trim())) throw new Error("API Key 格式无效");

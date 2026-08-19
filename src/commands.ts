@@ -185,6 +185,8 @@ export function commandHelp(): string {
     "  /dsh [install|start|open|status|stop|logs|restart]  管理官方 DSH Web",
     "  /exit                  保存并退出（也可按 Ctrl+C）",
     "",
+    "菜单提示：列出选项时可用 ↑/↓ 选择、Enter 确认、Esc 取消，",
+    "        数字可直接跳转；/model 菜单还可以直接输入自定义模型 ID。",
     "提示：输入 // 开头可把 / 当作普通消息发送。",
   ].join("\n");
 }

@@ -9,6 +9,7 @@ import {
   type CompleterResult,
   type Interface,
 } from "node:readline";
+import { clipToWidth } from "./text-width.js";
 
 type Completer = (line: string) => CompleterResult;
 
@@ -158,14 +159,16 @@ export class LineInput {
   private readonly completer?: Completer;
   private readonly suggestions?: SuggestionProvider;
   private readonly onResize?: ResizeHandler;
-  private readonly pasteInput?: BracketedPasteInput;
-  private readonly terminalInput?: NodeJS.ReadableStream;
+  private pasteInput?: BracketedPasteInput | undefined;
+  private terminalInput?: NodeJS.ReadableStream | undefined;
   private interface: Interface;
   private queued: string[] = [];
   private waiters: Array<(line: string | undefined) => void> = [];
   private pastedValues = new Map<string, string>();
   private pasteSequence = 0;
   private closed = false;
+  private suspending = false;
+  private lastPrompt = "";
   private suggestionsActive = false;
   private dismissedLine: string | undefined;
   private menuCapacity = 0;
@@ -344,6 +347,7 @@ export class LineInput {
     });
     instance.on("SIGINT", () => this.onInterrupt?.());
     instance.on("close", () => {
+      if (this.suspending) return;
       this.closed = true;
       this.promptEpoch += 1;
       this.terminalInput?.removeListener("keypress", this.handleKeypress);
@@ -363,6 +367,7 @@ export class LineInput {
     if (this.queued.length > 0) return this.queued.shift();
     if (this.closed) return undefined;
     this.promptEpoch += 1;
+    this.lastPrompt = prompt;
     this.suggestionsActive = options.suggestions ?? false;
     this.dismissedLine = undefined;
     this.menuCapacity = 0;
@@ -383,6 +388,49 @@ export class LineInput {
     }
   }
 
+  /**
+   * Hands the terminal over to a MenuPicker: the readline interface is closed
+   * (without marking this input as closed) and the paste transform detached so
+   * raw keystrokes reach the picker exclusively.
+   */
+  suspendForMenu(): void {
+    if (this.closed) return;
+    this.promptEpoch += 1;
+    this.menuCapacity = 0;
+    this.suggestionsActive = false;
+    this.suspending = true;
+    this.interface.close();
+    this.suspending = false;
+    this.terminalInput?.removeListener("keypress", this.handleKeypress);
+    if (this.pasteInput) {
+      this.input.unpipe(this.pasteInput);
+      this.pasteInput.destroy();
+      this.pasteInput = undefined;
+    }
+    this.terminalInput = undefined;
+  }
+
+  /** Rebuilds the readline interface after a MenuPicker finished. */
+  resumeFromMenu(): void {
+    if (this.closed) return;
+    if ((this.input as NodeJS.ReadStream).isTTY) {
+      this.pasteInput = new BracketedPasteInput(
+        (value) => this.replacePaste(value),
+        this.input as NodeJS.ReadStream,
+      );
+      this.input.pipe(this.pasteInput);
+    }
+    this.terminalInput = this.pasteInput ?? this.input;
+    this.interface = this.create(this.terminalInput);
+    if ((this.terminalInput as NodeJS.ReadStream).isTTY && this.suggestions) {
+      this.terminalInput.prependListener("keypress", this.handleKeypress);
+    }
+    if (this.waiters.length > 0) {
+      this.interface.setPrompt(this.lastPrompt);
+      this.interface.prompt();
+    }
+  }
+
   close(): void {
     if (!this.closed) this.interface.close();
   }
@@ -391,6 +439,203 @@ export class LineInput {
 class MutedOutput extends Writable {
   override _write(_chunk: Buffer | string, _encoding: BufferEncoding, callback: (error?: Error | null) => void): void {
     callback();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// MenuPicker: arrow-key navigable option lists (↑/↓ move, Enter confirms,
+// Esc cancels, digits jump; optionally typing composes a custom value).
+// ---------------------------------------------------------------------------
+
+export interface MenuPickerColor {
+  accent: (value: string) => string;
+  muted: (value: string) => string;
+}
+
+export interface MenuPickerOptions {
+  title: string;
+  items: readonly string[];
+  footer?: string;
+  allowCustom?: boolean;
+  customLabel?: string;
+  initial?: number;
+  color?: MenuPickerColor;
+}
+
+export type MenuPickerResult =
+  | { kind: "index"; index: number }
+  | { kind: "custom"; text: string }
+  | undefined;
+
+const ESCAPE_TIMEOUT_MS = 45;
+const CSI_FINAL_MIN = 0x40;
+const CSI_FINAL_MAX = 0x7e;
+
+export class MenuPicker {
+  private readonly input: NodeJS.ReadStream;
+  private readonly output: NodeJS.WritableStream;
+  private selected = 0;
+  private custom = "";
+  private printedLines = 0;
+  private escapeBuffer = "";
+  private inCsi = false;
+  private escapeTimer: NodeJS.Timeout | undefined;
+  private settled = false;
+
+  constructor(input: NodeJS.ReadableStream, output: NodeJS.WritableStream) {
+    this.input = input as NodeJS.ReadStream;
+    this.output = output;
+  }
+
+  run(options: MenuPickerOptions): Promise<MenuPickerResult> {
+    if (!this.input.isTTY) return Promise.reject(new Error("菜单选择需要 TTY 环境"));
+    const color: MenuPickerColor = options.color ?? { accent: (value) => value, muted: (value) => value };
+    this.selected = Math.max(0, Math.min(options.items.length - 1, options.initial ?? 0));
+    this.printedLines = 0;
+    this.escapeBuffer = "";
+    this.inCsi = false;
+    this.settled = false;
+
+    const width = (): number => {
+      const columns = (this.output as NodeJS.WriteStream).columns;
+      return Number.isFinite(columns) && columns > 0 ? Math.max(16, Math.floor(columns) - 2) : 78;
+    };
+
+    const render = (): void => {
+      const lines: string[] = [color.accent(options.title)];
+      options.items.forEach((item, index) => {
+        const clipped = clipToWidth(item, width());
+        lines.push(index === this.selected ? color.accent(`❯ ${clipped}`) : `  ${color.muted(clipped)}`);
+      });
+      if (options.allowCustom && this.custom.length > 0) {
+        lines.push(`${color.accent(options.customLabel ?? "自定义：")} ${this.custom}▏`);
+      }
+      if (options.footer) lines.push(color.muted(options.footer));
+      const text = lines.join("\r\n") + "\r\n";
+      if (this.printedLines > 0) {
+        this.output.write(`\u001b[${this.printedLines}A`);
+      }
+      for (let index = 0; index < this.printedLines; index += 1) {
+        this.output.write("\r\u001b[2K");
+      }
+      this.output.write(text);
+      this.printedLines = lines.length;
+    };
+
+    const clearEscapeTimer = (): void => {
+      if (this.escapeTimer) clearTimeout(this.escapeTimer);
+      this.escapeTimer = undefined;
+    };
+
+    let finish: (value: MenuPickerResult) => void = () => undefined;
+    const settle = (value: MenuPickerResult): void => {
+      if (this.settled) return;
+      this.settled = true;
+      clearEscapeTimer();
+      this.input.removeListener("data", onData);
+      if (this.printedLines > 0) {
+        this.output.write(`\u001b[${this.printedLines}A`);
+        for (let index = 0; index < this.printedLines; index += 1) {
+          this.output.write("\r\u001b[2K");
+        }
+      }
+      this.printedLines = 0;
+      this.input.setRawMode?.(false);
+      this.input.pause();
+      finish(value);
+    };
+
+    const handleCsiFinal = (final: string): void => {
+      if (final === "A") this.selected = Math.max(0, this.selected - 1);
+      else if (final === "B") this.selected = Math.min(options.items.length - 1, this.selected + 1);
+      this.escapeBuffer = "";
+      this.inCsi = false;
+      render();
+    };
+
+    const onData = (chunk: Buffer): void => {
+      const text = chunk.toString("utf8");
+      for (const character of text) {
+        if (this.settled) return;
+        const codePoint = character.codePointAt(0) ?? 0;
+
+        if (this.inCsi) {
+          clearEscapeTimer();
+          if (codePoint >= CSI_FINAL_MIN && codePoint <= CSI_FINAL_MAX) {
+            handleCsiFinal(character);
+          } else if (codePoint === 0x1b) {
+            this.escapeBuffer = "\u001b";
+            this.inCsi = false;
+          }
+          // Intermediate bytes (digits, ';', '1'..'9') accumulate invisibly.
+          continue;
+        }
+        if (this.escapeBuffer === "\u001b") {
+          clearEscapeTimer();
+          if (character === "[") {
+            this.inCsi = true;
+            continue;
+          }
+          // A lone Escape (no CSI) means cancel.
+          this.escapeBuffer = "";
+          settle(undefined);
+          return;
+        }
+
+        if (character === "\u001b") {
+          this.escapeBuffer = "\u001b";
+          this.escapeTimer = setTimeout(() => {
+            this.escapeTimer = undefined;
+            if (this.escapeBuffer === "\u001b" && !this.settled) {
+              this.escapeBuffer = "";
+              settle(undefined);
+            }
+          }, ESCAPE_TIMEOUT_MS);
+          this.escapeTimer.unref();
+          continue;
+        }
+        if (character === "\r" || character === "\n") {
+          if (options.allowCustom && this.custom.trim().length > 0) {
+            settle({ kind: "custom", text: this.custom.trim() });
+          } else {
+            settle({ kind: "index", index: this.selected });
+          }
+          return;
+        }
+        if (codePoint === 0x03) {
+          settle(undefined);
+          return;
+        }
+        if (codePoint === 0x7f || codePoint === 0x08) {
+          if (options.allowCustom && this.custom.length > 0) {
+            this.custom = this.custom.slice(0, -1);
+            render();
+          }
+          continue;
+        }
+        if (/[1-9]/u.test(character) && !options.allowCustom) {
+          const index = Number(character) - 1;
+          if (index < options.items.length) {
+            this.selected = index;
+            render();
+          }
+          continue;
+        }
+        if (options.allowCustom && !/[\u0000-\u001f\u007f]/u.test(character)) {
+          this.custom += character;
+          render();
+        }
+      }
+    };
+
+    this.input.resume();
+    this.input.setRawMode?.(true);
+    this.input.on("data", onData);
+    render();
+
+    return new Promise<MenuPickerResult>((resolve) => {
+      finish = resolve;
+    });
   }
 }
 

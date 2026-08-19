@@ -28,7 +28,7 @@ import type { FileLock } from "./fs-utils.js";
 import { commandHelp, parseSlashCommand, renderSlashCommandMenu, unescapePrompt } from "./commands.js";
 import { colorEnabled, createTheme, clearCurrentLine, type Theme } from "./theme.js";
 import { renderWelcomeScreen } from "./logo.js";
-import { LineInput, promptSecret } from "./input.js";
+import { LineInput, promptSecret, MenuPicker, type MenuPickerOptions, type MenuPickerResult } from "./input.js";
 import { DeepSeekApiError, getBalance, streamChat } from "./api.js";
 import { DEEPSEEK_URLS, openUrl } from "./open-url.js";
 import { DshManager, formatDshStatus, installDsh } from "./dsh.js";
@@ -311,25 +311,35 @@ export class DeepSeekTui {
     this.line();
   }
 
+  private async runMenu(options: MenuPickerOptions): Promise<MenuPickerResult> {
+    this.input.suspendForMenu();
+    try {
+      const picker = new MenuPicker(this.inputStream, this.output);
+      return await picker.run({
+        ...options,
+        color: { accent: this.theme.brightBlue, muted: this.theme.muted },
+      });
+    } finally {
+      this.input.resumeFromMenu();
+    }
+  }
+
   private async chooseSession(sessions: Session[]): Promise<Session | undefined> {
     if (sessions.length === 0) {
       this.line(this.theme.muted("当前工作目录还没有历史会话。"));
       return undefined;
     }
-    this.line(this.theme.bold("最近会话"));
-    sessions.slice(0, 12).forEach((session, index) => {
-      this.line(
-        `  ${this.theme.blue(String(index + 1).padStart(2))}  ${formatTime(session.updatedAt)}  ${shortText(session.title, 56)}`,
-      );
+    const visible = sessions.slice(0, 12);
+    const result = await this.runMenu({
+      title: "最近会话",
+      items: visible.map(
+        (session, index) =>
+          `${String(index + 1).padStart(2)}  ${formatTime(session.updatedAt)}  ${shortText(session.title, 48)}`,
+      ),
+      footer: "↑/↓ 选择 · Enter 确认 · Esc 取消 · 数字跳转",
     });
-    const answer = await this.input.next(this.theme.brightBlue("选择编号（回车取消）› "));
-    if (!answer?.trim()) return undefined;
-    const index = Number.parseInt(answer.trim(), 10) - 1;
-    if (!Number.isInteger(index) || index < 0 || index >= Math.min(sessions.length, 12)) {
-      this.line(this.theme.yellow("无效的会话编号。"));
-      return undefined;
-    }
-    return sessions[index];
+    if (!result || result.kind !== "index") return undefined;
+    return visible[result.index];
   }
 
   private async handleCommand(name: string, args: string, tokens: string[]): Promise<void> {
@@ -406,16 +416,24 @@ export class DeepSeekTui {
   private async changeModel(requested: string): Promise<void> {
     let model = requested.trim();
     if (!model) {
-      this.line(this.theme.bold("选择模型"));
-      RECOMMENDED_MODELS.forEach((item, index) => {
-        const current = this.session?.model === item.id ? this.theme.green(" ✓") : "";
-        this.line(`  ${this.theme.blue(String(index + 1))}  ${item.label}${current}`);
-        this.line(`     ${this.theme.muted(item.description)}`);
+      const result = await this.runMenu({
+        title: "选择模型",
+        items: RECOMMENDED_MODELS.map(
+          (item, index) =>
+            `${index + 1}  ${item.label}${this.session?.model === item.id ? " ✓" : ""}  ${item.description}`,
+        ),
+        allowCustom: true,
+        customLabel: "自定义模型：",
+        footer: "↑/↓ 选择 · Enter 确认 · Esc 取消 · 直接输入自定义模型 ID",
       });
-      const answer = await this.input.next(this.theme.brightBlue("编号或自定义模型名称（回车取消）› "));
-      if (!answer?.trim()) return;
-      const selected = RECOMMENDED_MODELS[Number.parseInt(answer.trim(), 10) - 1];
-      model = selected?.id ?? answer.trim();
+      if (!result) return;
+      if (result.kind === "custom") {
+        model = result.text;
+      } else {
+        const selected = RECOMMENDED_MODELS[result.index];
+        if (!selected) return;
+        model = selected.id;
+      }
     }
     if (!validModel(model)) {
       this.line(this.theme.yellow("模型名称无效。只允许字母、数字以及 . _ : / -"));
@@ -435,15 +453,17 @@ export class DeepSeekTui {
       await this.openAndReport(DEEPSEEK_URLS.apiKeys, "API Key 页面");
       return;
     }
-    this.line("  1  安全粘贴 API Key（输入不会显示）");
-    this.line("  2  在浏览器打开 DeepSeek API Key 页面");
-    this.line("  3  取消");
-    const choice = await this.input.next(this.theme.brightBlue("选择› "));
-    if (choice?.trim() === "2") {
+    const result = await this.runMenu({
+      title: "登录方式",
+      items: ["安全粘贴 API Key（输入不会显示）", "在浏览器打开 DeepSeek API Key 页面", "取消"],
+      footer: "↑/↓ 选择 · Enter 确认 · Esc 取消 · 数字跳转",
+    });
+    if (!result || result.kind !== "index") return;
+    if (result.index === 1) {
       await this.openAndReport(DEEPSEEK_URLS.apiKeys, "API Key 页面");
       return;
     }
-    if (choice?.trim() !== "1") return;
+    if (result.index !== 0) return;
 
     this.input.close();
     const key = await promptSecret("粘贴 API Key：", { input: this.inputStream, output: this.output });
@@ -806,20 +826,17 @@ export class DeepSeekTui {
     if (requested !== undefined && Number.isInteger(requested) && requested >= 1 && requested <= indexes.length) {
       chosenIndex = indexes[requested - 1];
     } else {
-      this.line(this.theme.bold("选择回退点（分支会话，原会话保留）"));
-      indexes.slice(-12).forEach((index, position) => {
-        const message = this.session?.messages[index];
-        if (!message) return;
-        this.line(`  ${this.theme.blue(String(position + 1).padStart(2))}  ${shortText(message.content, 56)}`);
+      const windowIndexes = indexes.slice(-12);
+      const result = await this.runMenu({
+        title: "选择回退点（分支会话，原会话保留）",
+        items: windowIndexes.map((index, position) => {
+          const message = this.session?.messages[index];
+          return `${String(position + 1).padStart(2)}  ${shortText(message?.content ?? "", 56)}`;
+        }),
+        footer: "↑/↓ 选择 · Enter 确认 · Esc 取消 · 数字跳转",
       });
-      const answer = await this.input.next(this.theme.brightBlue("选择编号（回车取消）› "));
-      if (!answer?.trim()) return;
-      const picked = Number.parseInt(answer.trim(), 10) - 1;
-      if (!Number.isInteger(picked) || picked < 0 || picked >= Math.min(indexes.length, 12)) {
-        this.line(this.theme.yellow("无效的编号。"));
-        return;
-      }
-      chosenIndex = indexes[indexes.length - Math.min(indexes.length, 12) + picked];
+      if (!result || result.kind !== "index") return;
+      chosenIndex = windowIndexes[result.index];
     }
     if (chosenIndex === undefined) return;
     await this.saveSession();
