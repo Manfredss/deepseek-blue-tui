@@ -139,7 +139,9 @@ function pidAlive(pid: number): boolean {
 
 function looksLikeDsh(pid: number, spawnImpl: typeof spawnSync = spawnSync): boolean {
   if (process.platform === "win32") return true;
-  const result = spawnImpl("ps", ["-p", String(pid), "-o", "command="], {
+  // Ask for an unlimited-width command line. BSD/macOS ps otherwise may
+  // truncate a long Node executable path before the identifying DSH segment.
+  const result = spawnImpl("ps", ["-ww", "-p", String(pid), "-o", "command="], {
     encoding: "utf8",
     timeout: 2_000,
   });

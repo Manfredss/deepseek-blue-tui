@@ -1,3 +1,5 @@
+import { userInfo } from "node:os";
+import { join } from "node:path";
 import type { AppConfig, ChatMessage, Session } from "./types.js";
 import { RECOMMENDED_MODELS } from "./types.js";
 import { ConfigStore, maskApiKey } from "./config.js";
@@ -9,15 +11,29 @@ import {
   SessionStore,
   truncateToLimit,
 } from "./session-store.js";
+import {
+  applyCompactSummary,
+  attachmentMessage,
+  buildContextBreakdown,
+  COMPACT_INSTRUCTION,
+  editPrompt,
+  forkSessionAt,
+  formatCompactTokens,
+  readAttachmentFile,
+  searchMessages,
+  userMessageIndexes,
+  writeSessionExport,
+} from "./session-tools.js";
 import type { FileLock } from "./fs-utils.js";
-import { completeSlashCommand, commandHelp, parseSlashCommand, unescapePrompt } from "./commands.js";
-import { createTheme, clearCurrentLine, type Theme } from "./theme.js";
-import { renderLogo } from "./logo.js";
+import { commandHelp, parseSlashCommand, renderSlashCommandMenu, unescapePrompt } from "./commands.js";
+import { colorEnabled, createTheme, clearCurrentLine, type Theme } from "./theme.js";
+import { renderWelcomeScreen } from "./logo.js";
 import { LineInput, promptSecret } from "./input.js";
 import { DeepSeekApiError, getBalance, streamChat } from "./api.js";
 import { DEEPSEEK_URLS, openUrl } from "./open-url.js";
 import { DshManager, formatDshStatus, installDsh } from "./dsh.js";
 import { LockHeldError } from "./fs-utils.js";
+import { renderContextHud, renderContextReport } from "./context-view.js";
 import { VERSION } from "./version.js";
 
 export interface TuiOptions {
@@ -37,11 +53,6 @@ export interface TuiOptions {
 
 function safeTerminalText(value: string): string {
   return value.replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g, "");
-}
-
-function shortPath(value: string, width = 54): string {
-  if (value.length <= width) return value;
-  return `…${value.slice(-(width - 1))}`;
 }
 
 function shortText(value: string, width = 900): string {
@@ -65,6 +76,14 @@ function formatTime(value: string): string {
   }).format(date);
 }
 
+function currentUsername(): string {
+  try {
+    return safeTerminalText(userInfo().username).trim().slice(0, 48) || "friend";
+  } catch {
+    return "friend";
+  }
+}
+
 export class DeepSeekTui {
   private readonly configStore: ConfigStore;
   private readonly sessionStore: SessionStore;
@@ -85,6 +104,8 @@ export class DeepSeekTui {
   private processInterrupt: () => void;
   private sessionLock: FileLock | undefined;
   private readOnly = false;
+  private mainPromptActive = false;
+  private homeScreenPristine = true;
 
   constructor(options: TuiOptions) {
     this.configStore = options.configStore;
@@ -94,7 +115,7 @@ export class DeepSeekTui {
     this.cwd = options.cwd;
     this.output = options.output ?? process.stdout;
     this.inputStream = options.input ?? process.stdin;
-    this.theme = createTheme((options.color ?? true) && Boolean(this.output.isTTY));
+    this.theme = createTheme((options.color ?? true) && colorEnabled(this.output));
     this.showLogo = options.showLogo ?? true;
     this.session = options.session;
     this.resumeQuery = options.resumeQuery;
@@ -106,7 +127,8 @@ export class DeepSeekTui {
     const input = new LineInput({
       input: this.inputStream,
       output: this.output,
-      completer: completeSlashCommand,
+      suggestions: (line, size) => renderSlashCommandMenu(line, { ...size, theme: this.theme }),
+      onResize: () => this.redrawHomeForResize(),
     });
     input.onInterrupt = () => this.handleInterrupt();
     return input;
@@ -118,6 +140,58 @@ export class DeepSeekTui {
 
   private line(value = ""): void {
     this.write(`${value}\n`);
+  }
+
+  private terminalColumns(): number {
+    const columns = this.output.columns;
+    return Number.isFinite(columns) && columns > 0 ? Math.max(16, columns - 2) : 92;
+  }
+
+  private terminalRows(): number {
+    const rows = this.output.rows;
+    return Number.isFinite(rows) && rows > 0 ? Math.max(8, rows) : 24;
+  }
+
+  private renderHome(): void {
+    if (!this.session) return;
+    const runtime = this.configStore.runtime(this.config);
+    if (this.showLogo) {
+      if (this.theme.enabled) this.write("\u001b[0m");
+      this.write(
+        renderWelcomeScreen(this.theme, {
+          columns: this.terminalColumns(),
+          rows: this.terminalRows(),
+          cwd: this.cwd,
+          model: this.session.model,
+          version: VERSION,
+          apiKeyConfigured: Boolean(runtime.apiKey),
+          username: currentUsername(),
+        }),
+      );
+    } else {
+      this.line(this.theme.bold(`DeepSeek TUI v${VERSION}`));
+      this.line(this.theme.muted(`Unofficial community client · ${this.cwd}`));
+    }
+    if (this.session.messages.length > 0) this.renderHistory(this.session);
+    const columns = this.terminalColumns();
+    this.line(this.theme.muted("─".repeat(columns)));
+    this.line(
+      `${this.theme.blue("●")} ${this.theme.bold(this.session.model)} ${this.theme.muted(columns < 40 ? "· /help" : "· /help 查看命令")}`,
+    );
+    if (!runtime.apiKey) {
+      this.line(
+        this.theme.yellow(
+          columns < 48 ? "未配置 API Key · /login" : "尚未配置 API Key。输入 /login 可安全粘贴，或打开 DeepSeek 平台。",
+        ),
+      );
+    }
+    this.line();
+  }
+
+  private redrawHomeForResize(): void {
+    if (!this.mainPromptActive || !this.homeScreenPristine || !this.session || this.controller) return;
+    this.write("\u001b[2J\u001b[H");
+    this.renderHome();
   }
 
   private handleInterrupt(): void {
@@ -186,36 +260,29 @@ export class DeepSeekTui {
     if (!(this.inputStream as NodeJS.ReadStream).isTTY || !this.output.isTTY) {
       throw new Error("交互模式需要 TTY；单次调用请使用 deepseek \"你的问题\"");
     }
-    if (this.showLogo) this.write(renderLogo(this.theme));
-    this.line(this.theme.muted(`  Unofficial community client v${VERSION}`));
-    this.line(this.theme.muted(`  ${shortPath(this.cwd)}`));
-    this.line();
     this.input = this.makeInput();
     process.on("SIGINT", this.processInterrupt);
 
     try {
       this.session = await this.initialSession();
       await this.lockSession(this.session);
-      if (this.session.messages.length > 0) this.renderHistory(this.session);
-      const runtime = this.configStore.runtime(this.config);
-      this.line(
-        `${this.theme.blue("●")} ${this.theme.bold(this.session.model)} ${this.theme.muted("· /help 查看命令")}`,
-      );
-      if (!runtime.apiKey) {
-        this.line(this.theme.yellow("尚未配置 API Key。输入 /login 可安全粘贴，或打开 DeepSeek 平台。"));
-      }
-      this.line();
+      this.homeScreenPristine = this.session.messages.length === 0 && !this.readOnly;
+      this.renderHome();
 
       while (!this.exitRequested) {
-        const line = await this.input.next(this.theme.brightBlue("❯ "));
+        this.mainPromptActive = true;
+        const line = await this.input.next(this.theme.brightBlue("❯ "), { suggestions: true });
+        this.mainPromptActive = false;
         if (line === undefined) break;
         const trimmed = line.trim();
         if (!trimmed) continue;
+        this.homeScreenPristine = false;
         const command = parseSlashCommand(line);
         if (command) await this.handleCommand(command.name, command.args, command.tokens);
         else await this.sendMessage(unescapePrompt(line));
       }
     } finally {
+      this.mainPromptActive = false;
       if (this.session && this.session.messages.length > 0 && !this.readOnly) {
         await this.sessionStore.save(this.session);
       }
@@ -303,6 +370,30 @@ export class DeepSeekTui {
         break;
       case "status":
         await this.showStatus();
+        break;
+      case "context":
+        await this.showContext();
+        break;
+      case "btw":
+        await this.sideQuestion(args);
+        break;
+      case "compact":
+        await this.compactConversation();
+        break;
+      case "export":
+        await this.exportConversation();
+        break;
+      case "edit":
+        await this.editInput(args);
+        break;
+      case "attach":
+        await this.attachFile(args);
+        break;
+      case "rewind":
+        await this.rewindConversation(tokens[0]);
+        break;
+      case "search":
+        await this.searchInSession(args);
         break;
       case "dsh":
         await this.handleDsh(tokens);
@@ -452,16 +543,310 @@ export class DeepSeekTui {
     if (!this.session) return;
     const runtime = this.configStore.runtime(this.config);
     const dshStatus = await this.dsh.status(this.config.dshPort);
-    this.line(`${this.theme.bold("模型")}      ${this.session.model}`);
-    this.line(`${this.theme.bold("API")}       ${runtime.baseUrl}`);
-    this.line(`${this.theme.bold("凭据")}      ${maskApiKey(runtime.apiKey)}${process.env.DEEPSEEK_API_KEY ? " (环境变量)" : ""}`);
-    this.line(`${this.theme.bold("会话")}      ${this.session.id} · ${this.session.messages.length} 条消息`);
     this.line(
-      `${this.theme.bold("上下文")}    ${estimateTokens(this.session.messages).toLocaleString()} / ${this.config.contextLimitTokens.toLocaleString()} tokens（估算）`,
+      renderContextHud(
+        this.theme,
+        {
+          model: this.session.model,
+          estimatedTokens: estimateTokens(this.session.messages),
+          limitTokens: this.config.contextLimitTokens,
+          messageCount: this.session.messages.length,
+          showReasoning: this.config.showReasoning,
+          readOnly: this.readOnly,
+          apiKeyConfigured: Boolean(runtime.apiKey),
+          usage: this.session.usage,
+          cwd: this.cwd,
+        },
+        { columns: this.terminalColumns() },
+      ),
     );
-    this.line(`${this.theme.bold("Token")}     ${this.session.usage.totalTokens.toLocaleString()} 总计`);
-    this.line(`${this.theme.bold("缓存命中")}  ${this.session.usage.promptCacheHitTokens.toLocaleString()}`);
+    this.line(
+      renderContextReport(
+        this.theme,
+        {
+          model: this.session.model,
+          estimatedTokens: estimateTokens(this.session.messages),
+          limitTokens: this.config.contextLimitTokens,
+          messageCount: this.session.messages.length,
+          showReasoning: this.config.showReasoning,
+          readOnly: this.readOnly,
+          apiKeyConfigured: Boolean(runtime.apiKey),
+          usage: this.session.usage,
+          cwd: this.cwd,
+        },
+        { columns: this.terminalColumns() },
+      ),
+    );
+    this.line(`${this.theme.bold("会话")}      ${this.session.id} · ${this.session.title}`);
+    this.line(`${this.theme.bold("Endpoint")}  ${runtime.baseUrl}`);
+    this.line(`${this.theme.bold("凭据")}      ${maskApiKey(runtime.apiKey)}${process.env.DEEPSEEK_API_KEY ? " (环境变量)" : ""}`);
+    const hit = this.session.usage.promptCacheHitTokens;
+    const miss = this.session.usage.promptCacheMissTokens;
+    const hitRate = hit + miss > 0 ? ((hit / (hit + miss)) * 100).toFixed(1) : "—";
+    this.line(`${this.theme.bold("缓存命中")}  ${this.session.usage.promptCacheHitTokens.toLocaleString()} (${hitRate}%)`);
+    this.line(`${this.theme.bold("速度")}      ${this.renderTpsLine()}`);
     this.line(`${this.theme.bold("DSH")}       ${formatDshStatus(dshStatus)}`);
+  }
+
+  private renderTpsLine(): string {
+    if (!this.session) return "";
+    const { lastTurnMs, lastCompletionTokens } = this.session;
+    if (!lastTurnMs || lastCompletionTokens === undefined || lastCompletionTokens === 0) {
+      return this.theme.muted("—（暂无最近一轮数据）");
+    }
+    const tps = lastCompletionTokens / (lastTurnMs / 1_000);
+    const value = `${tps.toFixed(1)} tok/s（最近一轮）`;
+    if (tps >= 50) return this.theme.green(value);
+    if (tps >= 20) return this.theme.yellow(value);
+    return this.theme.muted(value);
+  }
+
+  /** /context — per-message token audit plus segmented breakdown (dsh-TUI 借鉴). */
+  private async showContext(): Promise<void> {
+    if (!this.session) return;
+    const messages = this.session.messages;
+    this.line(this.theme.bold(`上下文明细（估算，共 ${messages.length} 条）`));
+    const head = messages.length > 50 ? messages.slice(-50) : messages;
+    if (messages.length > head.length) this.line(this.theme.muted(`… 已省略更早的 ${messages.length - head.length} 条`));
+    const labels: Record<ChatMessage["role"], string> = { system: "系统", user: "用户", assistant: "助手" };
+    head.forEach((message, index) => {
+      const offset = messages.length - head.length + index + 1;
+      const tokens = formatCompactTokens(estimateTokens([message]));
+      this.line(
+        `  ${this.theme.blue(String(offset).padStart(3))}  ${this.theme.muted(labels[message.role].padEnd(2))} ${this.theme.muted(tokens.padStart(6))}  ${shortText(message.content, 60)}`,
+      );
+    });
+    const breakdown = buildContextBreakdown(messages, this.config.contextLimitTokens, 30);
+    this.line();
+    this.line(this.theme.bold("分段构成"));
+    for (const segment of breakdown.segments) {
+      const label = segment.label === "thinking" ? "思考" : labels[segment.label];
+      this.line(
+        `  ${this.theme.muted(label.padEnd(4))} ${this.theme.blue("█".repeat(Math.max(1, Math.round(segment.percent / 100 * 20))).padEnd(20, " "))} ${formatCompactTokens(segment.tokens).padStart(7)} (${segment.percent.toFixed(0)}%)`,
+      );
+    }
+    this.line(`  合计 ${formatCompactTokens(breakdown.total)} / ${formatCompactTokens(breakdown.limit)} tokens（${breakdown.percent.toFixed(0)}%）`);
+  }
+
+  /** /btw — a single-turn side question that never enters session history. */
+  private async sideQuestion(prompt: string): Promise<void> {
+    if (!this.session) return;
+    const text = prompt.trim();
+    if (!text) {
+      this.line(this.theme.yellow("用法：/btw <问题>。侧问复用当前上下文做单轮调用，不写入会话历史。"));
+      return;
+    }
+    const runtime = this.configStore.runtime(this.config);
+    if (!runtime.apiKey) {
+      this.line(this.theme.yellow("缺少 API Key。请先输入 /login，或设置 DEEPSEEK_API_KEY。"));
+      return;
+    }
+    const request: ChatMessage[] = [...this.session.messages, { role: "user", content: text, createdAt: new Date().toISOString() }];
+    this.controller = new AbortController();
+    this.input.pause();
+    this.write(`\n${this.theme.muted("◇ 侧问（单轮，不写入会话）")}\n`);
+    let content = "";
+    let reasoning = "";
+    let reasoningShown = false;
+    let contentShown = false;
+    try {
+      const result = await streamChat({
+        apiKey: runtime.apiKey,
+        baseUrl: runtime.baseUrl,
+        model: this.session.model,
+        messages: request,
+        signal: this.controller.signal,
+        onReasoning: (delta) => {
+          reasoning += delta;
+          if (!this.config.showReasoning) return;
+          if (!reasoningShown) {
+            this.write(`${this.theme.muted(safeTerminalText(delta))}`);
+            reasoningShown = true;
+          } else this.write(this.theme.muted(safeTerminalText(delta)));
+        },
+        onContent: (delta) => {
+          content += delta;
+          if (!contentShown) {
+            if (reasoningShown) this.write("\n");
+            contentShown = true;
+          }
+          this.write(safeTerminalText(delta));
+        },
+      });
+      if (!contentShown && !reasoningShown) this.write(this.theme.muted("(没有文本响应)"));
+      this.write(`\n\n${this.theme.muted(`侧问结束 · ${result.usage.totalTokens.toLocaleString()} tokens（不计入会话）`)}\n\n`);
+    } catch (error) {
+      clearCurrentLine(this.output);
+      if ((error as Error).name === "AbortError") this.line(`\n${this.theme.yellow("已取消侧问。")}\n`);
+      else this.line(`\n${this.theme.red(`侧问失败：${this.errorMessage(error)}`)}\n`);
+    } finally {
+      this.controller = undefined;
+      this.input.resume();
+    }
+  }
+
+  /** /compact — summarize history into one system message, with auto backup. */
+  private async compactConversation(): Promise<void> {
+    if (!this.session) return;
+    const substantive = this.session.messages.filter((message) => message.role !== "system").length;
+    if (substantive === 0) {
+      this.line(this.theme.yellow("当前会话还没有可压缩的内容。"));
+      return;
+    }
+    const estimated = estimateTokens(this.session.messages);
+    this.line(
+      `将把 ${substantive} 条消息压缩为一段摘要并替换会话历史（估算 ${formatCompactTokens(estimated)} tokens → 摘要）。`,
+    );
+    const runtime = this.configStore.runtime(this.config);
+    if (!runtime.apiKey) {
+      this.line(this.theme.yellow("缺少 API Key。请先输入 /login，或设置 DEEPSEEK_API_KEY。"));
+      return;
+    }
+    const answer = await this.input.next(this.theme.brightBlue("确认压缩？压缩前会自动导出备份 [y/N] › "));
+    if (answer?.trim().toLocaleLowerCase() !== "y") {
+      this.line(this.theme.muted("已取消。"));
+      return;
+    }
+    try {
+      const backup = await writeSessionExport(this.session, join(this.configStore.home, "exports"));
+      this.line(this.theme.muted(`已备份到 ${backup}`));
+    } catch (error) {
+      this.line(this.theme.yellow(`备份失败，已取消压缩：${this.errorMessage(error)}`));
+      return;
+    }
+    const request: ChatMessage[] = [
+      ...this.session.messages,
+      { role: "user", content: COMPACT_INSTRUCTION, createdAt: new Date().toISOString() },
+    ];
+    this.controller = new AbortController();
+    this.input.pause();
+    this.write(`\n${this.theme.muted("● 正在压缩历史…")}`);
+    const startedAt = Date.now();
+    try {
+      const result = await streamChat({
+        apiKey: runtime.apiKey,
+        baseUrl: runtime.baseUrl,
+        model: this.session.model,
+        messages: request,
+        signal: this.controller.signal,
+      });
+      clearCurrentLine(this.output);
+      if (!result.content.trim()) {
+        this.line(this.theme.yellow("模型未返回摘要，已保持会话不变。"));
+        return;
+      }
+      this.session.messages = applyCompactSummary(result.content);
+      this.session.usage = addUsage(this.session.usage, result.usage);
+      this.session.lastTurnMs = Math.max(1, Date.now() - startedAt);
+      this.session.lastCompletionTokens = result.usage.completionTokens;
+      await this.saveSession();
+      const after = estimateTokens(this.session.messages);
+      this.line(
+        `${this.theme.green("✓")} 已压缩为 1 条摘要消息（${formatCompactTokens(after)} tokens）。${this.theme.muted("原历史已备份到 exports 目录，可用 /resume 恢复此前会话时参考。")}`,
+      );
+      this.line();
+    } catch (error) {
+      clearCurrentLine(this.output);
+      if ((error as Error).name === "AbortError") this.line(`\n${this.theme.yellow("已取消压缩。")}\n`);
+      else this.line(`\n${this.theme.red(`压缩失败：${this.errorMessage(error)}`)}\n`);
+    } finally {
+      this.controller = undefined;
+      this.input.resume();
+    }
+  }
+
+  /** /export — write the session transcript as Markdown into the data dir. */
+  private async exportConversation(): Promise<void> {
+    if (!this.session) return;
+    if (this.session.messages.length === 0) {
+      this.line(this.theme.yellow("当前会话还没有内容可导出。"));
+      return;
+    }
+    try {
+      const path = await writeSessionExport(this.session, join(this.configStore.home, "exports"));
+      this.line(`${this.theme.green("✓")} 已导出 ${this.session.messages.length} 条消息到 ${path}`);
+    } catch (error) {
+      this.line(this.theme.red(`导出失败：${this.errorMessage(error)}`));
+    }
+  }
+
+  /** /edit — compose the next message in $VISUAL/$EDITOR. */
+  private async editInput(initial: string): Promise<void> {
+    this.input.pause();
+    const result = await editPrompt({ initial: initial.trim() });
+    this.input.resume();
+    if (!result.ok) {
+      this.line(this.theme.yellow(result.error ?? "编辑已取消。"));
+      return;
+    }
+    await this.sendMessage(result.text ?? "");
+  }
+
+  /** /attach — read a text file (size-capped, binary-rejected) and send it. */
+  private async attachFile(input: string): Promise<void> {
+    const result = await readAttachmentFile(input, this.cwd);
+    if (!result.ok) {
+      this.line(this.theme.yellow(result.error ?? "无法附加文件。"));
+      return;
+    }
+    this.line(this.theme.muted(`@${result.path}`));
+    await this.sendMessage(attachmentMessage(result.path ?? "", result.content ?? ""));
+  }
+
+  /** /rewind — fork the session at an earlier user message (non-destructive). */
+  private async rewindConversation(token: string | undefined): Promise<void> {
+    if (!this.session) return;
+    const indexes = userMessageIndexes(this.session);
+    if (indexes.length < 2) {
+      this.line(this.theme.yellow("至少需要两条用户消息才能回退。"));
+      return;
+    }
+    let chosenIndex: number | undefined;
+    const requested = token ? Number.parseInt(token, 10) : undefined;
+    if (requested !== undefined && Number.isInteger(requested) && requested >= 1 && requested <= indexes.length) {
+      chosenIndex = indexes[requested - 1];
+    } else {
+      this.line(this.theme.bold("选择回退点（分支会话，原会话保留）"));
+      indexes.slice(-12).forEach((index, position) => {
+        const message = this.session?.messages[index];
+        if (!message) return;
+        this.line(`  ${this.theme.blue(String(position + 1).padStart(2))}  ${shortText(message.content, 56)}`);
+      });
+      const answer = await this.input.next(this.theme.brightBlue("选择编号（回车取消）› "));
+      if (!answer?.trim()) return;
+      const picked = Number.parseInt(answer.trim(), 10) - 1;
+      if (!Number.isInteger(picked) || picked < 0 || picked >= Math.min(indexes.length, 12)) {
+        this.line(this.theme.yellow("无效的编号。"));
+        return;
+      }
+      chosenIndex = indexes[indexes.length - Math.min(indexes.length, 12) + picked];
+    }
+    if (chosenIndex === undefined) return;
+    await this.saveSession();
+    const fork = forkSessionAt(this.session, chosenIndex);
+    this.session = fork;
+    await this.lockSession(fork);
+    this.renderHistory(fork);
+    this.line(`${this.theme.green("✓")} 已从该消息处分支新会话 ${fork.id.slice(0, 8)}；原会话仍可通过 /resume 恢复。`);
+  }
+
+  /** /search — line-grained full-text search over the current session. */
+  private async searchInSession(query: string): Promise<void> {
+    if (!this.session) return;
+    if (!query.trim()) {
+      this.line(this.theme.yellow("用法：/search <关键词>。在当前会话内全文搜索。"));
+      return;
+    }
+    const hits = searchMessages(this.session.messages, query);
+    if (hits.length === 0) {
+      this.line(this.theme.muted(`没有找到包含「${query.trim()}」的内容。`));
+      return;
+    }
+    const labels: Record<ChatMessage["role"], string> = { system: "系统", user: "用户", assistant: "助手" };
+    this.line(this.theme.bold(`会话内搜索「${query.trim()}」（${hits.length} 处匹配）`));
+    for (const hit of hits) {
+      this.line(`  ${this.theme.blue(`#${String(hit.index + 1).padStart(3)}`)} ${this.theme.muted(labels[hit.role].padEnd(2))} ${this.theme.muted(`L${String(hit.lineNumber).padStart(3)}`)}  ${hit.line}`);
+    }
   }
 
   private async handleDsh(tokens: string[]): Promise<void> {
@@ -550,6 +935,7 @@ export class DeepSeekTui {
     this.controller = new AbortController();
     this.input.pause();
     this.write(`\n${this.theme.muted("● 正在思考…")}`);
+    const startedAt = Date.now();
     let content = "";
     let reasoning = "";
     let reasoningShown = false;
@@ -593,6 +979,8 @@ export class DeepSeekTui {
       if (result.reasoningContent) assistant.reasoningContent = result.reasoningContent;
       this.session.messages.push(assistant);
       this.session.usage = addUsage(this.session.usage, result.usage);
+      this.session.lastTurnMs = Math.max(1, Date.now() - startedAt);
+      this.session.lastCompletionTokens = result.usage.completionTokens;
       await this.saveSession();
       this.write(`\n\n${this.theme.muted(`${result.usage.promptTokens.toLocaleString()} input · ${result.usage.completionTokens.toLocaleString()} output`)}\n\n`);
     } catch (error) {

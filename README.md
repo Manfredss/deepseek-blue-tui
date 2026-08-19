@@ -14,14 +14,16 @@
 - DeepSeek OpenAI-compatible API 流式聊天
 - 默认推荐 `deepseek-v4-flash`，可切换到 `deepseek-v4-pro` 或自定义模型 ID
 - Claude-like 的 `/model`、`/login`、`/usage`、`/clear`、`/resume`、`/exit` 等命令
+- 会话工作流全家桶：`/btw` 侧问（不写入会话）、`/compact` 历史压缩（自动备份）、`/export` Markdown 导出、`/rewind` 从更早消息分支、`/search` 会话内全文搜索
+- 输入增强：`/edit` 用 `$VISUAL`/`$EDITOR` 编写多行消息、`/attach` 附加文本文件（≤256 KiB、拒绝二进制）、bracketed paste 原样粘贴
+- 可观测性：`/status` 上下文 HUD + 分段进度条 + 缓存命中率 + 最近一轮 TPS；`/context` 逐条消息 token 审计
 - 按当前工作目录保存会话，支持标题、恢复和累计 Token 统计；跨终端文件锁防止互相覆盖
 - 上下文长度估算：接近上限时预警，超限时自动裁剪最早的普通消息（`contextLimitTokens` 可配）
 - 隐藏输入 API Key；也可只使用环境变量，不落盘密钥
-- 支持现代终端的 bracketed paste：多行内容会作为一条消息发送，并保留原始换行
 - 后台启动、打开、检查、停止和查看官方 DSH Web 日志；日志自动轮转并按规则脱敏
 - macOS、Linux 与 Windows 的浏览器打开适配
 
-当前终端界面是行式 REPL，而不是占用全屏的 widget TUI。它专注聊天与会话管理，不会自行读取文件、执行 shell、修改代码或调用 MCP。
+当前终端界面是行式 REPL，而不是占用全屏的 widget TUI。它专注聊天与会话管理，不会自行读取文件、执行 shell、修改代码或调用 MCP；`/attach` 只在用户显式指定路径时读取单个文本文件。
 
 ## 环境要求
 
@@ -84,19 +86,23 @@ export DEEPSEEK_API_KEY="sk-..."
 deepseek
 ```
 
-首次启动会看到蓝色鲸鱼和提示符：
+首次启动会看到响应式欢迎卡片、蓝色鲸鱼和提示符。宽终端使用双栏，窄终端自动切为单栏；开始对话前调整窗口尺寸，首屏会即时重绘。对话开始后保留 scrollback，不会为了重排擦除历史：
 
 ```text
-                            ▄▄▄▄▄▄▄
-                    ▄▄████████████████▄▄
-                ▄████▀▀            ▀▀████▄
-                         ...
-                       DeepSeek Terminal
-
+╭─ DeepSeek TUI v0.1.0 ───────────────────────────────────────────────╮
+│        Welcome back!         │ Tips for getting started             │
+│      ▄▄▄▄▄▄▄       ▄▄  ▄▄    │ /login   Configure your API key     │
+│  ▄████████████▄    ███▄███   │ /model   Switch the model           │
+│▄████████████▀ ▀██████████▀   │ /resume  Continue a conversation    │
+│████▀    ▀████▄  ▀██●████▄    │ /dsh     Open Harness Web           │
+│ deepseek-v4-flash · API …    │ /help    Show every command         │
+╰────────────────────────────────────────────────────────────────────╯
+──────────────────────────────────────────────────────────────────────
+● deepseek-v4-flash · /help 查看命令
 ❯ 你好
 ```
 
-Logo 只在交互模式出现。使用 `--no-logo` 可隐藏，使用 `--no-color` 可关闭 ANSI 颜色。一次典型的会话长这样：
+Logo 只在交互模式出现。使用 `--no-logo` 可隐藏，使用 `--no-color` 可关闭 ANSI 颜色。支持真彩色的终端使用 DeepSeek 品牌蓝 `#4D6BFE`；Apple Terminal 等 256 色终端会自动使用最接近的安全蓝色，且不会设置终端背景色。一次典型的会话长这样：
 
 ```text
 ❯ /model
@@ -176,7 +182,7 @@ deepseek dsh status
 
 ## 交互斜杠命令
 
-在提示符输入 `/help` 可查看命令，输入命令前缀后按 `Tab` 可补全。命令只会在消息开头识别；若确实要把 `/model` 作为普通消息发给模型，请输入 `//model`。
+在主提示符键入 `/` 会即时展开命令菜单；继续输入（例如 `/mo`）会实时过滤，按 `Esc` 可收起。菜单会根据终端的最新宽度和高度重新排版，窄窗口自动隐藏说明文字。命令只会在消息开头识别；若确实要把 `/model` 作为普通消息发给模型，请输入 `//model`。二级选择提示（例如 `/model` 的编号选择）不会错误弹出菜单。
 
 | 命令 | 行为 |
 | --- | --- |
@@ -190,7 +196,15 @@ deepseek dsh status
 | `/resume [ID/标题]` | 浏览或匹配当前目录的历史会话 |
 | `/rename <标题>` | 重命名当前会话，最长保存 100 个字符 |
 | `/thinking [on\|off]` | 显示、隐藏或切换思考过程的可见性 |
-| `/status` | 显示模型、Endpoint、遮罩凭据、会话 Token、上下文估算与 DSH 状态 |
+| `/status` | 上下文 HUD、Token/缓存/最近一轮 TPS、Endpoint、遮罩凭据与 DSH 状态 |
+| `/context` | 逐条消息的 token 估算与按角色/思考的分段构成 |
+| `/btw <问题>` | 侧问：复用当前上下文做单轮问答，不写入会话历史、不计入会话 Token |
+| `/compact` | 把历史压缩为一条摘要消息（压缩前自动导出备份到数据目录） |
+| `/export` | 把当前会话导出为 Markdown 文件（保存到数据目录 `exports/`） |
+| `/edit [草稿]` | 用 `$VISUAL`/`$EDITOR`（未设置时 vi/notepad）编写下一条多行消息 |
+| `/attach <路径>` | 附加一个文本文件（支持 `~` 和相对路径，≤256 KiB，拒绝二进制）并发送 |
+| `/rewind [编号]` | 从更早的用户消息分支一个新会话；原会话保持不变 |
+| `/search <关键词>` | 在当前会话内做不区分大小写的逐行全文搜索 |
 | `/dsh [动作] [端口]` | 管理 DSH；动作见下一节 |
 | `/exit` | 保存并退出；`/quit` 或提示符下 `Ctrl+C` 也可退出 |
 
@@ -272,6 +286,8 @@ deepseek-tui/
 ├── sessions/
 │   ├── <uuid>.json      # 消息、reasoning、工作目录与 Token 统计
 │   └── <uuid>.json.lock # 会话文件锁（防止两个终端互相覆盖；进程退出后自动释放）
+├── exports/
+│   └── <标题>-<id8>.md  # /export 与 /compact 备份产生的 Markdown 记录
 └── dsh/
     ├── state.json       # 由本项目启动的 DSH PID/端口/工作目录
     ├── dsh.log          # DSH stdout/stderr（展示时脱敏）
@@ -300,10 +316,10 @@ deepseek-tui/
 
 ## 当前限制
 
-- 没有内置文件、shell、Git、Web Search、MCP、Skills 或工具调用；这些能力交给 DSH
-- 没有可逐行编辑的多行编辑器、Markdown 全屏渲染、图片输入或键盘驱动弹窗；但标准 bracketed paste 多行内容会聚合成一条消息
-- 上下文管理是估算预警 + 超限裁剪，不是模型级的自动压缩；估算使用启发式（CJK ≈ 1 token/字，ASCII ≈ 4 字/token）
-- 没有系统钥匙串、会话删除/导出命令或跨设备同步
+- 没有内置文件、shell、Git、Web Search、MCP、Skills 或工具调用；这些能力交给 DSH；`/attach` 仅按用户显式路径读取单个文本文件
+- 没有逐行内联的多行编辑器、Markdown 全屏渲染、图片输入或键盘驱动弹窗；多行输入可用 `/edit`（外部编辑器）或 bracketed paste
+- 上下文管理是估算预警 + 超限裁剪 + `/compact` 手动摘要压缩，不是模型级的自动压缩；估算使用启发式（CJK ≈ 1 token/字，ASCII ≈ 4 字/token）
+- 没有系统钥匙串、会话删除命令或跨设备同步；导出用 `/export`
 - `/usage` 查询账号余额并打开官方页面，余额请求默认 15 秒超时；当前不计算精确的会话货币成本
 
 完整竞品调研与设计取舍见 [RESEARCH.md](./RESEARCH.md)。

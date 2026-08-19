@@ -86,6 +86,7 @@ export async function runOneShot(options: {
     let content = "";
     let reasoning = "";
     let reasoningHeader = false;
+    const startedAt = Date.now();
     try {
       const result = await streamChat({
         apiKey: runtime.apiKey,
@@ -117,6 +118,8 @@ export async function runOneShot(options: {
       if (result.reasoningContent) assistant.reasoningContent = result.reasoningContent;
       session.messages.push(assistant);
       session.usage = addUsage(session.usage, result.usage);
+      session.lastTurnMs = Math.max(1, Date.now() - startedAt);
+      session.lastCompletionTokens = result.usage.completionTokens;
       await options.sessionStore.save(session);
     } catch (error) {
       if (content || reasoning) {

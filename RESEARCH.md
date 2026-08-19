@@ -29,9 +29,29 @@ deepseek dsh / /dsh  官方 DSH Web 的后台启动器和进程管理入口
 | [OpenCode](https://github.com/anomalyco/opencode) | 开源、provider-agnostic 的完整编码 agent，提供终端/桌面体验、build/plan agent 和子代理 | 清晰区分只读规划与可执行工作、成熟的多 provider 方向 | 本项目只直接服务 DeepSeek/OpenAI-compatible API，体积和权限面更小 |
 | [DeepSeek Reasonix](https://github.com/esengine/DeepSeek-Reasonix) | DeepSeek-native 终端/桌面编码 agent；其 [main-v2 CLI Reference](https://github.com/esengine/DeepSeek-Reasonix/blob/main-v2/docs/CLI.md) 展示模型、状态、会话恢复、权限与工具相关命令 | `/status` 信息密度、命令分类、可诊断性 | 本项目没有 agent 工具链，仅保留对轻聊天有价值的少量命令 |
 | [Deep Code](https://github.com/lessweb/deepcode-cli) | 第三方 Claude-style DeepSeek 编码助手；DeepSeek 官方文档提供了[集成指南](https://api-docs.deepseek.com/quick_start/agent_integrations/deepcode)，列出 `/new`、`/resume`、`/exit` 和 Skills | 证明 Claude-like 命令对 DeepSeek 用户已有认知基础 | 它面向编码与 Skills；本项目更轻，并把智能体能力交给官方 DSH |
+| [dsh-TUI](https://github.com/ccch1mneyyy/dsh-TUI) | 被 DeepSeek Harness 官方公众号收录的 Claude Code 风格 TUI 插件（Ink/React，自带 ink fork）；像素鲸鱼顶栏、实时工作状态行、思考流式展开、双击 Esc 会话 rewind、上下文分段进度条与 TPS 仪表、`/btw` 侧问、`/compact`、`/export`、外部编辑器、`@` 文件引用、历史搜索、主题与 i18n，并有 VS Code companion 扩展 | 侧问不污染会话、压缩/导出/回退的工作流、上下文与 TPS 的可观测性设计、按内容类型分段的上下文进度条 | 它是 DSH 的插件前端（挂进 harness 事件流），本项目是独立直连 API 的行式 REPL；借鉴其命令语义与可观测性思路，重构为无 React、无 plugin runtime 的轻实现，详见下文「对 dsh-TUI 的借鉴与差异」 |
 | [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) | DeepSeek AI 官方开源 agent harness；“一切皆插件”，提供 Web UI、工具、session log、sandbox/approval 与 agent loop | 作为高权限 companion，而不是在聊天客户端重复实现 agent runtime | 本项目仅管理它的进程和浏览器入口，不嵌入、不 fork，也不接管 DSH 的配置或数据 |
 
 另外，DeepSeek 官方已经给出把 DeepSeek API 接入 [Claude Code、OpenCode 等工具](https://api-docs.deepseek.com/guides/coding_agents)的方法。对需要成熟编码 agent 的用户，这些方案往往比扩张本项目的权限面更合适。
+
+## 对 dsh-TUI 的借鉴与差异
+
+[dsh-TUI](https://github.com/ccch1mneyyy/dsh-TUI)（2026-08 调研）是当前 DeepSeek 生态中完成度最高的 Claude Code 风格终端体验，已被 DeepSeek Harness 官方公众号收录。本项目不复制其 Ink/React 架构（它 fork 了整套 Ink 渲染器，约数万行），而是借鉴其**交互语义与可观测性设计**，重写为行式 REPL 的轻实现：
+
+| dsh-TUI 的设计 | 本项目的借鉴实现 | 差异与创新 |
+| --- | --- | --- |
+| `/btw` 侧问：复用上下文、无工具、单轮、不写 session log | `/btw <问题>`：单轮 streamChat，不进 `messages`、不计会话 usage | 同一套 AbortController 中断路径与错误处理；行式内联输出，无浮层面板 |
+| `/compact` 历史压缩 | `/compact`：确认后模型摘要替换历史为一条 system 消息 | **压缩前自动导出备份**到 `exports/`，误操作可查；usage 计入会话 |
+| `/export` 会话导出 | `/export`：Markdown 记录（含思考过程）写入数据目录 | 文件名含标题与 ID 前缀，不覆盖已有导出 |
+| 双击 Esc 会话 rewind（DSH session fork） | `/rewind [编号]`：列出最近用户消息，fork 出新会话 | 永远非破坏性：原会话保持原样，新会话标题带 `· rewind` |
+| `@` 文件引用（目录遍历补全、图片块） | `/attach <路径>`：单文件文本附加 | 无补全、无图片；显式 256 KiB 上限 + NUL 检测拒绝二进制，守住低权限边界 |
+| `Ctrl+X` 外部编辑器 | `/edit [草稿]`：`$VISUAL`→`$EDITOR`→vi/notepad | 编辑产物直接作为下一条消息发送，多行输入不需要 Shift+Enter |
+| 上下文分段进度条 + TPS 仪表 | `/status` HUD（`≈25% · ██░░ · RW · API ready`）+ 缓存命中率 + 最近一轮 TPS（≥50 绿 / ≥20 黄） | `/context` 另提供**逐条消息 token 审计**，是直连 API 客户端独有的可观测性 |
+| `/` 会话内全文搜索（n/N 跳转） | `/search <关键词>`：逐行不区分大小写，带消息编号与行号 | 无跳转交互，结果一次性列出 |
+| 紧凑 token 计数（`988`、`3.4k`、`12k`、`1.0M`） | `formatCompactTokens` 同款格式 | 非有限值输出 `—`，避免 NaN 进入终端 |
+| 会话浏览器、主题、i18n、插件协议、轨迹场景 | 不做 | 行式 REPL 刻意保持小而可审计；见「已知差距」 |
+
+边界保持不变：本项目仍然不执行 shell、不写工作区文件、不做 agent 工具链；上述借鉴只扩展了**会话工作流与可观测性**，不扩大权限面（`/attach` 是唯一新增的文件访问，且只读、限大小、拒二进制）。
 
 ## 官方 API 事实与实现影响
 
@@ -158,12 +178,13 @@ DeepSeek API 的调用凭据是 API Key。本项目提供两条真实路径：�
 
 这些不是已承诺功能，而是调研后最有价值的改进顺序（v0.1 已落地文件锁、上下文估算预警/裁剪、bracketed paste、DSH 显式安装与日志轮转脱敏，故从清单中移除）：
 
-1. 系统钥匙串适配与明确的数据删除/导出命令
-2. 模型级上下文压缩：现有实现是启发式估算 + 超限裁剪，不是压缩或摘要
-3. 完整多行编辑、Markdown 渲染和更多终端兼容性测试（标准 bracketed paste 已支持单消息聚合）
+1. 系统钥匙串适配与明确的数据删除命令（导出已有 `/export`，删除仍未提供）
+2. 模型级上下文压缩：现有实现是启发式估算 + 超限裁剪 + `/compact` 手动摘要，不是自动压缩
+3. 内联多行编辑、Markdown 渲染和更多终端兼容性测试（`/edit` 外部编辑器与 bracketed paste 已覆盖多行输入的主路径）
 4. `/doctor`：检查 Node、命令冲突、凭据来源、Endpoint 和 DSH 版本
 5. 会话级精确费用估算；价格必须动态或显式带版本，不能长期硬编码
 6. DSH 版本兼容矩阵和更明确的 stale state 修复入口（日志轮转与脱敏已完成）
+7. 借鉴 dsh-TUI 但暂未采纳的能力：会话浏览器式 `/resume`、主题、界面语言切换、消息选择模式、输入历史搜索（Ctrl+R 等价物）
 
 若未来加入文件或命令工具，必须先设计 workspace 边界、逐项审批、审计日志、超时、输出上限和跨平台 sandbox，不能仅把 shell 接到模型输出上。
 
@@ -190,3 +211,5 @@ DeepSeek API 的调用凭据是 API Key。本项目提供两条真实路径：�
 - [DeepSeek Reasonix](https://github.com/esengine/DeepSeek-Reasonix)
 - [DeepSeek Reasonix main-v2 CLI Reference](https://github.com/esengine/DeepSeek-Reasonix/blob/main-v2/docs/CLI.md)
 - [Deep Code](https://github.com/lessweb/deepcode-cli)
+- [dsh-TUI 仓库](https://github.com/ccch1mneyyy/dsh-TUI)
+- [dsh-TUI 交互与命令](https://github.com/ccch1mneyyy/dsh-TUI/blob/main/docs/interaction.md)

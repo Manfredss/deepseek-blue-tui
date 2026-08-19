@@ -79,3 +79,18 @@ test("ordinary line input remains unchanged", async (t) => {
   input.write("two\r");
   assert.equal(await second, "two");
 });
+
+test("split CSI arrow keys survive the paste-marker prefix timer", async (t) => {
+  const { input, lineInput } = createInput(t);
+  const result = lineInput.next("❯ ");
+
+  input.write("ac");
+  input.write("\u001b");
+  await new Promise<void>((resolve) => setTimeout(resolve, 5));
+  input.write("[");
+  await new Promise<void>((resolve) => setTimeout(resolve, 5));
+  input.write("D");
+  input.write("\r");
+
+  assert.equal(await result, "ac", "a split arrow CSI must be consumed as one key, not leak [D into the line");
+});

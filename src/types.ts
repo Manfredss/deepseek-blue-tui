@@ -26,6 +26,10 @@ export interface Session {
   updatedAt: string;
   messages: ChatMessage[];
   usage: TokenUsage;
+  /** Wall-clock duration of the most recent completed generation, in ms. */
+  lastTurnMs?: number;
+  /** Completion tokens of the most recent completed generation (for TPS). */
+  lastCompletionTokens?: number;
 }
 
 export interface AppConfig {

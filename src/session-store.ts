@@ -41,7 +41,7 @@ export function parseSession(value: unknown): Session | undefined {
   if (typeof value.cwd !== "string" || typeof value.model !== "string") return undefined;
   if (!Array.isArray(value.messages)) return undefined;
   const messages = value.messages.map(cleanMessage).filter((message): message is ChatMessage => Boolean(message));
-  return {
+  const session: Session = {
     version: 1,
     id: value.id,
     title: typeof value.title === "string" && value.title ? value.title : "New conversation",
@@ -52,6 +52,17 @@ export function parseSession(value: unknown): Session | undefined {
     messages,
     usage: cleanUsage(value.usage),
   };
+  if (typeof value.lastTurnMs === "number" && Number.isFinite(value.lastTurnMs) && value.lastTurnMs >= 0) {
+    session.lastTurnMs = value.lastTurnMs;
+  }
+  if (
+    typeof value.lastCompletionTokens === "number" &&
+    Number.isFinite(value.lastCompletionTokens) &&
+    value.lastCompletionTokens >= 0
+  ) {
+    session.lastCompletionTokens = value.lastCompletionTokens;
+  }
+  return session;
 }
 
 export function createSession(cwd: string, model: string, now = new Date()): Session {

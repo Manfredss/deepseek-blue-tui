@@ -21,7 +21,11 @@ const STUB_SOURCE = `
 import { createServer } from "node:net";
 const index = process.argv.indexOf("--port");
 const port = Number(index >= 0 ? process.argv[index + 1] : "0");
-const server = createServer((socket) => socket.end("HTTP/1.1 200 OK\\r\\nContent-Length: 2\\r\\n\\r\\nok"));
+const server = createServer((socket) => {
+  // Readiness probes disconnect as soon as TCP opens, so ignore that expected reset.
+  socket.on("error", () => undefined);
+  socket.end("HTTP/1.1 200 OK\\r\\nContent-Length: 2\\r\\n\\r\\nok");
+});
 server.listen(port, "127.0.0.1", () => {
   console.log("dsh web: http://127.0.0.1:" + port);
 });
@@ -63,18 +67,8 @@ async function freePort(): Promise<number> {
   return port;
 }
 
-/**
- * CI runners provide a working `/bin/ps`; restricted sandboxes may not
- * (setuid exec is blocked on some macOS setups). Fall back to an emulated
- * `ps` that reports the stub's real command line, which is exactly what the
- * identity check needs to see.
- */
-function psImplFor(stubEntry: string): typeof spawnSync {
-  const real = spawnSync("ps", ["-p", String(process.pid), "-o", "command="], {
-    encoding: "utf8",
-    timeout: 2_000,
-  });
-  if (real.status === 0 && typeof real.stdout === "string" && real.stdout.length > 0) return spawnSync;
+/** Returns deterministic process metadata without depending on host ps permissions. */
+function matchingPsFor(stubEntry: string): typeof spawnSync {
   const stubSource = join(stubEntry, "..", "lib", "stub.mjs");
   return ((_command: string, args: string[]) => {
     const pid = Number(args[args.indexOf("-p") + 1]);
@@ -91,10 +85,19 @@ function psImplFor(stubEntry: string): typeof spawnSync {
 }
 
 test("DshManager runs the full cross-platform lifecycle against a stub DSH", async (t) => {
+  let cleanupPid: number | undefined;
+  t.after(() => {
+    if (!cleanupPid) return;
+    try {
+      process.kill(cleanupPid, "SIGKILL");
+    } catch {
+      // Already gone.
+    }
+  });
   const directory = await temporaryDirectory(t, "deepseek-dsh-lifecycle-");
   const stub = await writeDshStub(directory);
   const home = join(directory, "home");
-  const manager = new DshManager(home, psImplFor(stub));
+  const manager = new DshManager(home, matchingPsFor(stub));
   const port = await freePort();
 
   // Pre-fill an oversized log so start() must rotate it.
@@ -106,7 +109,11 @@ test("DshManager runs the full cross-platform lifecycle against a stub DSH", asy
   assert.ok(command, "stub must resolve via DEEPSEEK_DSH_COMMAND");
   assert.equal(command.source, "custom");
 
-  const running = await manager.start({ port, command, cwd: directory, waitMs: 15_000 });
+  const running = await manager.start({ port, command, cwd: directory, waitMs: 15_000 }).catch(async (error: unknown) => {
+    cleanupPid = (await manager.readState())?.pid;
+    throw error;
+  });
+  cleanupPid = running.pid;
   assert.equal(running.phase, "running");
   assert.equal(running.port, port);
   assert.ok(running.pid);
@@ -128,40 +135,53 @@ test("DshManager runs the full cross-platform lifecycle against a stub DSH", asy
     port,
     url: `http://127.0.0.1:${port}`,
   });
+  cleanupPid = undefined;
 });
 
 test("DshManager refuses to stop when process identity cannot be confirmed", {
   skip: process.platform === "win32" ? "Windows skips the ps-based identity check by design" : false,
 }, async (t) => {
+  let cleanupPid: number | undefined;
+  t.after(() => {
+    if (!cleanupPid) return;
+    try {
+      process.kill(cleanupPid, "SIGKILL");
+    } catch {
+      // Already gone.
+    }
+  });
   const directory = await temporaryDirectory(t, "deepseek-dsh-refuse-");
   const stub = await writeDshStub(directory);
-  const mismatchingPs = (() => ({
-    status: 0,
-    signal: null,
-    pid: 0,
-    output: ["", ""],
-    stdout: "some-unrelated-process",
-    stderr: "",
-    error: undefined,
-  })) as unknown as typeof spawnSync;
+  let psCommand: string | undefined;
+  let psArgs: readonly string[] | undefined;
+  const mismatchingPs = ((command: string, args: readonly string[]) => {
+    psCommand = command;
+    psArgs = args;
+    return {
+      status: 0,
+      signal: null,
+      pid: 0,
+      output: ["", ""],
+      stdout: "some-unrelated-process",
+      stderr: "",
+      error: undefined,
+    };
+  }) as unknown as typeof spawnSync;
   const manager = new DshManager(join(directory, "home"), mismatchingPs);
   const port = await freePort();
 
   const command = resolveDshCommand({ env: { ...process.env, DEEPSEEK_DSH_COMMAND: stub } });
   assert.ok(command);
-  const running = await manager.start({ port, command, cwd: directory, waitMs: 15_000 });
+  const running = await manager.start({ port, command, cwd: directory, waitMs: 15_000 }).catch(async (error: unknown) => {
+    cleanupPid = (await manager.readState())?.pid;
+    throw error;
+  });
+  cleanupPid = running.pid;
   assert.equal(running.phase, "running");
   assert.ok(running.pid);
-  t.after(() => {
-    if (running.pid) {
-      try {
-        process.kill(running.pid, "SIGKILL");
-      } catch {
-        // Already gone.
-      }
-    }
-  });
 
   await assert.rejects(manager.stop(), /与 DSH 不匹配/);
+  assert.equal(psCommand, "ps");
+  assert.deepEqual(psArgs, ["-ww", "-p", String(running.pid), "-o", "command="]);
   assert.equal(await isPortOpen(port, "127.0.0.1", 300), true, "the stub must still be running");
 });

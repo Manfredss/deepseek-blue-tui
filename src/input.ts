@@ -1,8 +1,33 @@
 import { StringDecoder } from "node:string_decoder";
 import { Transform, Writable } from "node:stream";
-import { createInterface, type CompleterResult, type Interface } from "node:readline";
+import {
+  clearLine,
+  clearScreenDown,
+  createInterface,
+  cursorTo,
+  moveCursor,
+  type CompleterResult,
+  type Interface,
+} from "node:readline";
 
 type Completer = (line: string) => CompleterResult;
+
+export interface TerminalSize {
+  columns: number;
+  rows: number;
+}
+
+export interface LineInputNextOptions {
+  suggestions?: boolean;
+}
+
+type SuggestionProvider = (line: string, size: TerminalSize) => readonly string[];
+type ResizeHandler = (size: TerminalSize) => void;
+
+interface Keypress {
+  name?: string;
+  ctrl?: boolean;
+}
 
 const PASTE_START = "\u001b[200~";
 const PASTE_END = "\u001b[201~";
@@ -70,11 +95,19 @@ class BracketedPasteParser {
     this.insidePaste = false;
     return output;
   }
+
+  flushPendingPrefix(): string {
+    if (this.insidePaste || this.buffered.length === 0) return "";
+    const output = this.buffered;
+    this.buffered = "";
+    return output;
+  }
 }
 
 class BracketedPasteInput extends Transform {
   private readonly decoder = new StringDecoder("utf8");
   private readonly parser: BracketedPasteParser;
+  private prefixTimer: NodeJS.Timeout | undefined;
   isTTY = true;
   isRaw = false;
 
@@ -94,14 +127,28 @@ class BracketedPasteInput extends Transform {
   }
 
   override _transform(chunk: Buffer, _encoding: BufferEncoding, callback: (error?: Error | null) => void): void {
+    if (this.prefixTimer) clearTimeout(this.prefixTimer);
     this.push(this.parser.push(this.decoder.write(chunk)));
+    this.prefixTimer = setTimeout(() => {
+      this.prefixTimer = undefined;
+      this.push(this.parser.flushPendingPrefix());
+    }, 25);
+    this.prefixTimer.unref();
     callback();
   }
 
   override _flush(callback: (error?: Error | null) => void): void {
+    if (this.prefixTimer) clearTimeout(this.prefixTimer);
+    this.prefixTimer = undefined;
     this.push(this.parser.push(this.decoder.end()));
     this.push(this.parser.finish());
     callback();
+  }
+
+  override _destroy(error: Error | null, callback: (error?: Error | null) => void): void {
+    if (this.prefixTimer) clearTimeout(this.prefixTimer);
+    this.prefixTimer = undefined;
+    callback(error);
   }
 }
 
@@ -109,23 +156,35 @@ export class LineInput {
   private readonly input: NodeJS.ReadableStream;
   private readonly output: NodeJS.WritableStream;
   private readonly completer?: Completer;
+  private readonly suggestions?: SuggestionProvider;
+  private readonly onResize?: ResizeHandler;
   private readonly pasteInput?: BracketedPasteInput;
+  private readonly terminalInput?: NodeJS.ReadableStream;
   private interface: Interface;
   private queued: string[] = [];
   private waiters: Array<(line: string | undefined) => void> = [];
   private pastedValues = new Map<string, string>();
   private pasteSequence = 0;
   private closed = false;
+  private suggestionsActive = false;
+  private dismissedLine: string | undefined;
+  private menuCapacity = 0;
+  private promptEpoch = 0;
+  private refreshQueued = false;
   onInterrupt?: () => void;
 
   constructor(options: {
     input?: NodeJS.ReadableStream;
     output?: NodeJS.WritableStream;
     completer?: Completer;
+    suggestions?: SuggestionProvider;
+    onResize?: ResizeHandler;
   } = {}) {
     this.input = options.input ?? process.stdin;
     this.output = options.output ?? process.stdout;
     if (options.completer) this.completer = options.completer;
+    if (options.suggestions) this.suggestions = options.suggestions;
+    if (options.onResize) this.onResize = options.onResize;
     if ((this.input as NodeJS.ReadStream).isTTY) {
       this.pasteInput = new BracketedPasteInput(
         (value) => this.replacePaste(value),
@@ -134,7 +193,118 @@ export class LineInput {
       this.input.pipe(this.pasteInput);
       this.output.write(ENABLE_BRACKETED_PASTE);
     }
-    this.interface = this.create(this.pasteInput ?? this.input);
+    this.terminalInput = this.pasteInput ?? this.input;
+    this.interface = this.create(this.terminalInput);
+    if ((this.terminalInput as NodeJS.ReadStream).isTTY && this.suggestions) {
+      this.terminalInput.prependListener("keypress", this.handleKeypress);
+      this.output.on("resize", this.handleResize);
+    }
+  }
+
+  private readonly handleKeypress = (_character: string | undefined, key: Keypress = {}): void => {
+    if (!this.suggestionsActive || this.closed) return;
+    if (key.name === "escape") {
+      this.dismissedLine = this.interface.line;
+      this.eraseMenuFromPrompt();
+      return;
+    }
+    if (key.name === "return" || key.name === "enter" || (key.ctrl && key.name === "c")) {
+      this.promptEpoch += 1;
+      this.eraseMenuFromPrompt();
+      return;
+    }
+    this.scheduleSuggestionRefresh();
+  };
+
+  private readonly handleResize = (): void => {
+    if (!this.suggestionsActive || this.closed) return;
+    const epoch = this.promptEpoch;
+    queueMicrotask(() => {
+      if (this.closed || !this.suggestionsActive || epoch !== this.promptEpoch) return;
+      this.clearMenuForResize();
+      this.onResize?.(this.terminalSize());
+      this.interface.prompt(true);
+      this.refreshSuggestions();
+    });
+  };
+
+  private terminalSize(): TerminalSize {
+    const output = this.output as NodeJS.WriteStream;
+    const rawColumns = Number.isFinite(output.columns) && output.columns > 0 ? output.columns : 80;
+    const rawRows = Number.isFinite(output.rows) && output.rows > 0 ? output.rows : 24;
+    return {
+      columns: Math.max(16, rawColumns - 2),
+      rows: Math.max(4, rawRows),
+    };
+  }
+
+  private scheduleSuggestionRefresh(): void {
+    if (this.refreshQueued) return;
+    this.refreshQueued = true;
+    const epoch = this.promptEpoch;
+    queueMicrotask(() => {
+      this.refreshQueued = false;
+      if (this.closed || !this.suggestionsActive || epoch !== this.promptEpoch) return;
+      if (this.dismissedLine !== undefined && this.dismissedLine !== this.interface.line) this.dismissedLine = undefined;
+      this.refreshSuggestions();
+    });
+  }
+
+  private refreshSuggestions(): void {
+    if (!this.suggestions || !this.suggestionsActive || this.dismissedLine === this.interface.line) {
+      this.eraseMenuFromPrompt();
+      return;
+    }
+    if (this.interface.getCursorPos().rows > 0) {
+      this.eraseMenuFromPrompt();
+      return;
+    }
+    this.paintMenu([...this.suggestions(this.interface.line, this.terminalSize())]);
+  }
+
+  private allocateMenuRows(capacity: number): void {
+    if (capacity <= this.menuCapacity) return;
+    const additional = capacity - this.menuCapacity;
+    const cursor = this.interface.getCursorPos();
+    if (this.menuCapacity > 0) moveCursor(this.output, 0, this.menuCapacity);
+    for (let index = 0; index < additional; index += 1) this.output.write("\r\n");
+    moveCursor(this.output, 0, -capacity);
+    cursorTo(this.output, cursor.cols);
+    this.menuCapacity = capacity;
+  }
+
+  private paintMenu(lines: readonly string[]): void {
+    this.allocateMenuRows(lines.length);
+    if (this.menuCapacity === 0) return;
+    const cursor = this.interface.getCursorPos();
+    this.output.write("\u001b[?25l");
+    for (let index = 0; index < this.menuCapacity; index += 1) {
+      moveCursor(this.output, 0, 1);
+      cursorTo(this.output, 0);
+      clearLine(this.output, 0);
+      const line = lines[index];
+      if (line) this.output.write(line);
+    }
+    moveCursor(this.output, 0, -this.menuCapacity);
+    cursorTo(this.output, cursor.cols);
+    this.output.write("\u001b[?25h");
+  }
+
+  private eraseMenuFromPrompt(): void {
+    if (this.menuCapacity > 0) this.paintMenu([]);
+  }
+
+  private clearMenuForResize(): void {
+    if (this.menuCapacity === 0) return;
+    const cursor = this.interface.getCursorPos();
+    this.output.write("\u001b[?25l");
+    moveCursor(this.output, 0, 1);
+    cursorTo(this.output, 0);
+    clearScreenDown(this.output);
+    moveCursor(this.output, 0, -1);
+    cursorTo(this.output, cursor.cols);
+    this.output.write("\u001b[?25h");
+    this.menuCapacity = 0;
   }
 
   private replacePaste(value: string): string {
@@ -159,10 +329,14 @@ export class LineInput {
       terminal: Boolean((input as NodeJS.ReadStream).isTTY),
       historySize: 500,
       removeHistoryDuplicates: true,
+      escapeCodeTimeout: 100,
     };
     if (this.completer) options.completer = this.completer;
     const instance = createInterface(options);
     instance.on("line", (line) => {
+      this.suggestionsActive = false;
+      this.dismissedLine = undefined;
+      this.menuCapacity = 0;
       line = this.restorePastes(line);
       const waiter = this.waiters.shift();
       if (waiter) waiter(line);
@@ -171,6 +345,9 @@ export class LineInput {
     instance.on("SIGINT", () => this.onInterrupt?.());
     instance.on("close", () => {
       this.closed = true;
+      this.promptEpoch += 1;
+      this.terminalInput?.removeListener("keypress", this.handleKeypress);
+      this.output.removeListener("resize", this.handleResize);
       if (this.pasteInput) {
         this.output.write(DISABLE_BRACKETED_PASTE);
         this.input.unpipe(this.pasteInput);
@@ -182,9 +359,13 @@ export class LineInput {
     return instance;
   }
 
-  async next(prompt: string): Promise<string | undefined> {
+  async next(prompt: string, options: LineInputNextOptions = {}): Promise<string | undefined> {
     if (this.queued.length > 0) return this.queued.shift();
     if (this.closed) return undefined;
+    this.promptEpoch += 1;
+    this.suggestionsActive = options.suggestions ?? false;
+    this.dismissedLine = undefined;
+    this.menuCapacity = 0;
     this.interface.setPrompt(prompt);
     this.interface.prompt();
     return await new Promise<string | undefined>((resolve) => this.waiters.push(resolve));

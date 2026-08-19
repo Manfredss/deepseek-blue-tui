@@ -193,8 +193,8 @@ test("renderLogo renders a blue whale and styled product title", () => {
   assert.match(plain, /DeepSeek Terminal/);
   assert.equal(plain.includes("\u001b["), false);
 
-  const colored = renderLogo(createTheme(true));
-  assert.match(colored, /^\u001b\[38;2;77;107;254m/);
+  const colored = renderLogo(createTheme(true, { COLORTERM: "truecolor" }));
+  assert.match(colored, /\u001b\[38;2;77;107;254m/);
   assert.match(colored, /\u001b\[1mDeepSeek\u001b\[22m/);
   assert.match(colored, /\u001b\[38;2;128;138;157mTerminal\u001b\[0m/);
 });
