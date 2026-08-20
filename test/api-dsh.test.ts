@@ -535,5 +535,5 @@ test("installDsh installs the pinned version through npm when dsh is missing", a
   assert.equal(result.command.source, "path");
   assert.equal(result.command.command, dshTarget);
   assert.equal(result.command.version, "0.1.0-rc.7");
-  assert.equal(await readFile(marker, "utf8"), "ran\n");
+  assert.equal((await readFile(marker, "utf8")).trim(), "ran");
 });

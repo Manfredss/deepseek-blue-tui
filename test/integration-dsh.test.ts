@@ -119,7 +119,16 @@ test("DshManager runs the full cross-platform lifecycle against a stub DSH", asy
   assert.ok(running.pid);
   assert.equal(await isPortOpen(port, "127.0.0.1", 500), true);
 
-  const logs = await manager.logs(10);
+  // The stub writes its readiness line from the listen callback; on
+  // Windows the bytes may reach the inherited log file shortly after
+  // the port opens, so poll briefly instead of racing the file read.
+  const logDeadline = Date.now() + 5_000;
+  let logs = "";
+  while (Date.now() < logDeadline) {
+    logs = await manager.logs(20);
+    if (/dsh web: http:\/\/127\.0\.0\.1/.test(logs)) break;
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
+  }
   assert.match(logs, /dsh web: http:\/\/127\.0\.0\.1/);
 
   // Rotation moved the oversized log aside and started a fresh one.
