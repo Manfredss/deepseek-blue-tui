@@ -31,7 +31,15 @@ jobs:
       # Static check + unit tests + the cross-platform DSH lifecycle
       # integration test (stub DSH on every OS).
       - name: Typecheck and tests
-        run: npm run check
+        shell: pwsh
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP 'check.log'
+          npm run check *>&1 | Tee-Object -FilePath $log
+          $status = $LASTEXITCODE
+          if ($status -ne 0) {
+            node .github/ci-annotate.cjs
+          }
+          exit $status
 
       - name: Build
         run: npm run build
