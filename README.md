@@ -88,19 +88,8 @@ deepseek
 
 首次启动会看到响应式欢迎卡片、蓝色鲸鱼和提示符。真彩/256 色终端会显示 dsh-TUI 同款半块像素鲸鱼（40×13 终端单元格，深蓝轮廓、DeepSeek 蓝身体、冰蓝腹部），ANSI-16 与纯文本模式回退到下方的前景鲸鱼。宽终端使用双栏，窄终端自动切为单栏；开始对话前调整窗口尺寸，首屏会即时重绘。对话开始后保留 scrollback，不会为了重排擦除历史：
 
-```text
-╭─ DeepSeek TUI v0.1.0 ───────────────────────────────────────────────╮
-│        Welcome back!         │ Tips for getting started             │
-│      ▄▄▄▄▄▄▄       ▄▄  ▄▄    │ /login   Configure your API key     │
-│  ▄████████████▄    ███▄███   │ /model   Switch the model           │
-│▄████████████▀ ▀██████████▀   │ /resume  Continue a conversation    │
-│████▀    ▀████▄  ▀██●████▄    │ /dsh     Open Harness Web           │
-│ deepseek-v4-flash · API …    │ /help    Show every command         │
-╰────────────────────────────────────────────────────────────────────╯
-──────────────────────────────────────────────────────────────────────
-● deepseek-v4-flash · /help 查看命令
-❯ 你好
-```
+<img width="913" height="721" alt="Screenshot 2026-08-20 at 12 30 44 pm" src="https://github.com/user-attachments/assets/24d79a7f-c292-4174-97d8-e258ff515512" />
+
 
 Logo 只在交互模式出现。使用 `--no-logo` 可隐藏，使用 `--no-color` 可关闭 ANSI 颜色。支持真彩色的终端使用 DeepSeek 品牌蓝 `#4D6BFE`；Apple Terminal 等 256 色终端会自动使用最接近的安全蓝色。像素鲸鱼只设置鲸鱼单元格的前景/背景色，不会修改终端全局背景色。一次典型的会话长这样：
 
