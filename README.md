@@ -1,8 +1,10 @@
 # DeepSeek Blue TUI
 
-一个面向 DeepSeek API 的轻量终端聊天客户端：输入 `deepseek` 即可进入交互界面，支持流式输出、模型切换、会话恢复、余额查询，以及对官方 DeepSeek Harness（DSH）Web UI 的后台管理。
+一个面向 DeepSeek API 的轻量终端聊天客户端：输入 `deepseek` 即可进入交互界面，支持流式输出、模型切换、会话恢复、余额查询，以及对官方 DeepSeek Harness（DSH）Web UI 的后台管理。欢迎大家使用并提出反馈！
 
 > 本项目是非官方社区项目，不隶属于 DeepSeek AI 或 Anthropic。它借鉴了 Claude Code 的命令习惯，但不是 Claude Code 的复刻，也不是完整的编码智能体。需要读写文件、运行命令、调用工具或规划任务时，请使用集成的官方 DSH。
+
+Co-authored by Deepseek Harness.
 
 <!-- 仓库推送到 https://github.com/manfredss/deepseek-blue-tui 后 CI 徽章自动生效 -->
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
@@ -10,12 +12,12 @@
 
 ## 功能概览
 
-- `deepseek` 启动交互终端，显示 DeepSeek 蓝色 ASCII 大鲸鱼；`dstui` 是等价的中性别名
+- `deepseek` 启动交互终端，显示 DeepSeek 蓝鲸鱼（真彩/256 色终端为 dsh-TUI 同款半块像素鲸鱼，ANSI-16 或 `--no-color` 时回退字符鲸鱼）；`dstui` 是等价的中性别名
 - DeepSeek OpenAI-compatible API 流式聊天
 - 默认推荐 `deepseek-v4-flash`，可切换到 `deepseek-v4-pro` 或自定义模型 ID
-- Claude-like 的 `/model`、`/login`、`/usage`、`/clear`、`/resume`、`/exit` 等命令
+- Claude-like 的 `/model`、`/login`、`/usage`、`/clear`、`/resume`、`/exit` 等命令；主提示符输入 `/` 后可用 `↑`/`↓` 选择命令
 - 会话工作流全家桶：`/btw` 侧问（不写入会话）、`/compact` 历史压缩（自动备份）、`/export` Markdown 导出、`/rewind` 从更早消息分支、`/search` 会话内全文搜索
-- 输入增强：`/edit` 用 `$VISUAL`/`$EDITOR` 编写多行消息、`/attach` 附加文本文件（≤256 KiB、拒绝二进制）、bracketed paste 原样粘贴
+- 输入增强：`/edit` 用 `$VISUAL`/`$EDITOR` 编写多行消息、`/attach` 附加文本文件（≤256 KiB、拒绝二进制）、bracketed paste 多行粘贴聚合为一条消息
 - 可观测性：`/status` 上下文 HUD + 分段进度条 + 缓存命中率 + 最近一轮 TPS；`/context` 逐条消息 token 审计
 - 按当前工作目录保存会话，支持标题、恢复和累计 Token 统计；跨终端文件锁防止互相覆盖
 - 上下文长度估算：接近上限时预警，超限时自动裁剪最早的普通消息（`contextLimitTokens` 可配）
@@ -86,7 +88,7 @@ export DEEPSEEK_API_KEY="sk-..."
 deepseek
 ```
 
-首次启动会看到响应式欢迎卡片、蓝色鲸鱼和提示符。真彩/256 色终端会显示 dsh-TUI 同款半块像素鲸鱼（40×13 终端单元格，深蓝轮廓、DeepSeek 蓝身体、冰蓝腹部），ANSI-16 与纯文本模式回退到下方的前景鲸鱼。宽终端使用双栏，窄终端自动切为单栏；开始对话前调整窗口尺寸，首屏会即时重绘。对话开始后保留 scrollback，不会为了重排擦除历史：
+首次启动会看到响应式欢迎卡片、蓝色鲸鱼和提示符。真彩/256 色终端会显示 dsh-TUI 同款半块像素鲸鱼（40×13 终端单元格，深蓝轮廓、DeepSeek 蓝身体、冰蓝腹部），ANSI-16 与纯文本模式回退到字符鲸鱼。宽终端使用双栏，窄终端自动切为单栏；开始对话前调整窗口尺寸，首屏会即时重绘。对话开始后保留 scrollback，不会为了重排擦除历史：
 
 <img width="913" height="721" alt="Screenshot 2026-08-20 at 12 30 44 pm" src="https://github.com/user-attachments/assets/24d79a7f-c292-4174-97d8-e258ff515512" />
 
@@ -95,11 +97,15 @@ Logo 只在交互模式出现。使用 `--no-logo` 可隐藏，使用 `--no-colo
 
 ```text
 ❯ /model
-  1  DeepSeek V4 Flash ✓
-     快速、低成本，适合作为默认模型
-  2  DeepSeek V4 Pro
-     能力更强，适合复杂任务
-编号或自定义模型名称（回车取消）› 2
+选择模型
+
+❯ 1  DeepSeek V4 Flash ✓  快速、低成本，适合作为默认模型
+  2  DeepSeek V4 Pro      能力更强，适合复杂任务
+
+↑/↓ 选择 · Enter 确认 · Esc 取消 · 直接输入自定义模型 ID
+```
+（按数字 `2` 或选中后回车）
+```text
 ✓ 已切换到 deepseek-v4-pro
 
 ❯ 用一句话解释什么是大语言模型
@@ -108,11 +114,14 @@ Logo 只在交互模式出现。使用 `--no-logo` 可隐藏，使用 `--no-colo
 大语言模型是在海量文本上训练、通过预测下一个词来学习语言的神经网络……
 
 ❯ /status
+deepseek-v4-pro · ctx ≈0% (89/131k) · RW · reasoning hidden · API ready
+上下文报告
 模型      deepseek-v4-pro
-API       https://api.deepseek.com
+消息      2 条
+累计 Token 89（输入 54 · 输出 35 · 思考 0）
+会话      e071f4dd · 用一句话解释什么是大语言模型
+Endpoint  https://api.deepseek.com
 凭据      sk-12••••cdef
-会话      e071f4dd · 2 条消息
-Token     89 总计
 
 ❯ /exit
 再见。
@@ -173,7 +182,7 @@ deepseek dsh status
 
 在主提示符键入 `/` 会即时展开命令菜单；继续输入（例如 `/mo`）会实时过滤，按 `Esc` 可收起。菜单出现后可用 `↑`/`↓` 在所有匹配命令中移动高亮（长列表会自动滚动），按 `Enter` 直接执行高亮命令；如果还没有按过方向键，`Enter` 仍按普通输入提交。菜单会根据终端的最新宽度和高度重新排版，窄窗口自动隐藏说明文字。命令只会在消息开头识别；若确实要把 `/model` 作为普通消息发给模型，请输入 `//model`。二级选择提示（例如 `/model` 的编号选择）不会错误弹出菜单。
 
-主命令菜单和所有选项列表（`/model` 选择器、`/resume` 会话列表、`/rewind` 回退点、`/login` 登录方式）都是**可键盘导航的菜单**：`↑`/`↓` 移动高亮，`Enter` 确认当前项，`Esc` 取消，数字键直接跳转；`/model` 菜单还支持直接键入自定义模型 ID 后回车。
+主命令菜单支持 `↑`/`↓` 移动高亮、`Enter` 执行、`Esc` 收起。所有二级选项列表（`/model` 选择器、`/resume` 会话列表、`/rewind` 回退点、`/login` 登录方式）都是**可键盘导航的菜单**：`↑`/`↓` 移动高亮，`Enter` 确认当前项，`Esc` 取消，数字键直接跳转；`/model` 菜单还支持直接键入自定义模型 ID 后回车。
 
 | 命令 | 行为 |
 | --- | --- |
@@ -181,7 +190,7 @@ deepseek dsh status
 | `/login` | 选择隐藏粘贴 API Key，或打开官方 API Key 页面 |
 | `/login browser` | 直接打开官方 API Key 页面；不会自动把网页登录态带回终端 |
 | `/logout` | 删除 `config.json` 中保存的 API Key；环境变量仍可能生效 |
-| `/usage` | 有 Key 时先查询余额，再打开官方用量页 |
+| `/usage` | 有 Key 时先查询余额；无论有没有 Key，之后都会打开官方用量页 |
 | `/usage topup` | 查询余额并打开充值页；`top-up` 也可使用 |
 | `/clear` | 保存当前会话并开始空会话；旧会话仍可恢复 |
 | `/resume [ID/标题]` | 浏览或匹配当前目录的历史会话 |
@@ -197,11 +206,12 @@ deepseek dsh status
 | `/rewind [编号]` | 从更早的用户消息分支一个新会话；原会话保持不变 |
 | `/search <关键词>` | 在当前会话内做不区分大小写的逐行全文搜索 |
 | `/dsh [动作] [端口]` | 管理 DSH；动作见下一节 |
+| `/help` | 显示全部斜杠命令和菜单/快捷键提示 |
 | `/exit` | 保存并退出；`/quit` 或提示符下 `Ctrl+C` 也可退出 |
 
 另外支持 `/new` 作为 `/clear` 的别名、`/sessions` 作为 `/resume` 的别名。生成过程中按 `Ctrl+C` 会取消本次生成；已收到的部分内容仍会保存在会话中。
 
-会话使用文件锁防止两个终端同时写同一会话：第二个终端会提示进入只读模式（可以继续提问，但回复不落盘），第一个终端退出后重启即可恢复读写。同一会话在同一终端内不会受影响。
+会话使用文件锁防止两个终端同时写同一会话：第二个终端会提示进入只读模式（可以继续提问，但回复不落盘）。第一个终端不受影响，仍正常读写；关闭第一个终端后，新开的实例即可恢复读写。
 
 `/thinking` 和 `--thinking` 只控制是否把 API 返回的 `reasoning_content` 显示在终端，不等同于切换模型的 thinking 参数。
 
@@ -216,7 +226,7 @@ deepseek dsh install
 # 后台启动并打开浏览器（默认 127.0.0.1:3080）
 deepseek dsh start
 
-# 连接到已运行的实例并打开；也允许打开该端口上的外部实例
+# 打开 DSH Web；已有运行实例就直接连接，没有就后台启动；也允许打开外部实例
 deepseek dsh open
 
 # 状态、日志、重启和停止
@@ -276,7 +286,7 @@ deepseek-tui/
 ├── config.json          # 模型、Endpoint、显示偏好、DSH 端口、contextLimitTokens；可能含 API Key
 ├── sessions/
 │   ├── <uuid>.json      # 消息、reasoning、工作目录与 Token 统计
-│   └── <uuid>.json.lock # 会话文件锁（防止两个终端互相覆盖；进程退出后自动释放）
+│   └── <uuid>.json.lock # 会话文件锁（防止两个终端互相覆盖；正常退出释放，异常残留会被接管）
 ├── exports/
 │   └── <标题>-<id8>.md  # /export 与 /compact 备份产生的 Markdown 记录
 └── dsh/
@@ -308,7 +318,7 @@ deepseek-tui/
 ## 当前限制
 
 - 没有内置文件、shell、Git、Web Search、MCP、Skills 或工具调用；这些能力交给 DSH；`/attach` 仅按用户显式路径读取单个文本文件
-- 没有逐行内联的多行编辑器、Markdown 全屏渲染、图片输入或键盘驱动弹窗；多行输入可用 `/edit`（外部编辑器）或 bracketed paste
+- 没有逐行内联的多行编辑器、Markdown 全屏渲染或图片输入；多行输入可用 `/edit`（外部编辑器）或 bracketed paste。菜单选择是行式 REPL 里的列表，不是全屏 widget 弹窗
 - 上下文管理是估算预警 + 超限裁剪 + `/compact` 手动摘要压缩，不是模型级的自动压缩；估算使用启发式（CJK ≈ 1 token/字，ASCII ≈ 4 字/token）
 - 没有系统钥匙串、会话删除命令或跨设备同步；导出用 `/export`
 - `/usage` 查询账号余额并打开官方页面，余额请求默认 15 秒超时；当前不计算精确的会话货币成本
@@ -378,4 +388,4 @@ DEEPSEEK_TUI_HOME=/tmp/deepseek-blue-tui-dev npm run dev -- dsh status
 
 代码以 [MIT License](./LICENSE) 发布。
 
-“DeepSeek”及相关标识属于其权利人。本项目标题、命令名与蓝色视觉用于描述兼容的服务；鲸鱼是本项目绘制的终端 ASCII 图案，强调色为 `#4D6BFE`，不声称是 DeepSeek 官方 Logo 或官方品牌规范。Claude 与 Claude Code 属于 Anthropic；本项目仅借鉴其终端交互惯例，未使用其代码或视觉资产。
+“DeepSeek”及相关标识属于其权利人。本项目标题、命令名与蓝色视觉用于描述兼容的服务，强调色为 `#4D6BFE`，不声称是 DeepSeek 官方 Logo 或官方品牌规范。彩色半块像素鲸鱼 sprite 来自 MIT 授权的 [dsh-TUI](https://github.com/ccch1mneyyy/dsh-TUI)（`src/components/Whale.tsx`）；纯文本字符鲸鱼为本项目绘制。Claude 与 Claude Code 属于 Anthropic；本项目仅借鉴其终端交互惯例，未使用 Anthropic 的代码或视觉资产。
