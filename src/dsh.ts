@@ -350,7 +350,9 @@ export class DshManager {
     const windowsShellCommand = process.platform === "win32" && /\.(?:cmd|bat)$/i.test(command.command);
     const child = spawn(command.command, args, {
       cwd: options.cwd ?? process.cwd(),
-      detached: true,
+      // A detached cmd.exe shim gets a fresh console on Windows and the
+      // Node grandchild's stdout no longer reaches the inherited log file.
+      detached: windowsShellCommand ? false : true,
       stdio: ["ignore", logDescriptor, logDescriptor],
       env: dshChildEnvironment(),
       windowsHide: true,
