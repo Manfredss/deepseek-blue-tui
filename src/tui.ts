@@ -25,7 +25,7 @@ import {
   writeSessionExport,
 } from "./session-tools.js";
 import type { FileLock } from "./fs-utils.js";
-import { commandHelp, parseSlashCommand, renderSlashCommandMenu, unescapePrompt } from "./commands.js";
+import { commandHelp, parseSlashCommand, renderSlashCommandMenu, slashCommandSuggestions, unescapePrompt } from "./commands.js";
 import { colorEnabled, createTheme, clearCurrentLine, type Theme } from "./theme.js";
 import { renderWelcomeScreen } from "./logo.js";
 import { LineInput, promptSecret, MenuPicker, type MenuPickerOptions, type MenuPickerResult } from "./input.js";
@@ -127,7 +127,10 @@ export class DeepSeekTui {
     const input = new LineInput({
       input: this.inputStream,
       output: this.output,
-      suggestions: (line, size) => renderSlashCommandMenu(line, { ...size, theme: this.theme }),
+      suggestions: (line, size, selected) => ({
+        lines: renderSlashCommandMenu(line, { ...size, theme: this.theme, selected }),
+        values: slashCommandSuggestions(line).map(({ command }) => command),
+      }),
       onResize: () => this.redrawHomeForResize(),
     });
     input.onInterrupt = () => this.handleInterrupt();

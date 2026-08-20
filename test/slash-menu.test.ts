@@ -99,6 +99,25 @@ test("slash menu respects terminal columns and available rows", () => {
   }
 });
 
+test("slash menu highlights the selected command and scrolls to later matches", () => {
+  const theme = createTheme(false);
+
+  const first = renderSlashCommandMenu("/", { columns: 60, rows: 10, theme, selected: 0 });
+  assert.ok(stripAnsi(first.join("\n")).includes("❯ /model"), "first command should carry the selection marker");
+  assert.ok(!stripAnsi(first.join("\n")).includes("❯ /login"), "only one command may be highlighted");
+
+  const scrolled = renderSlashCommandMenu("/", { columns: 60, rows: 10, theme, selected: 5 });
+  const scrolledPlain = scrolled.map(stripAnsi);
+  assert.ok(scrolledPlain.some((line) => line.includes("❯ /status")), "selected command should be in the visible window");
+  assert.ok(!scrolledPlain.some((line) => line.includes("/model")), "commands scrolled out above should be hidden");
+  assert.match(scrolledPlain.at(-1) ?? "", /↑ 3/);
+  assert.match(scrolledPlain.at(-1) ?? "", /14 more/);
+
+  const last = renderSlashCommandMenu("/", { columns: 60, rows: 10, theme, selected: 19 });
+  assert.ok(last.some((line) => stripAnsi(line).includes("❯ /rename")), "final command should be reachable");
+  assert.ok(last.every((line) => visibleWidth(line) <= 60), "selected/scroll rows must stay within the viewport");
+});
+
 test("slash menu shows at most five commands and reports the remaining matches", () => {
   const theme = createTheme(false);
   const rendered = renderSlashCommandMenu("/", { columns: 92, rows: 31, theme });
@@ -198,6 +217,31 @@ function hasEraseSequence(value: string): boolean {
   return /\u001b\[(?:\d+;?)*(?:J|K)/u.test(value);
 }
 
+function createSelectableLiveInput(t: TestContext): {
+  input: TtyInput;
+  lineInput: LineInput;
+  output: TtyOutput;
+  rendered: () => string;
+} {
+  const input = new TtyInput();
+  const output = new TtyOutput();
+  const theme = createTheme(false);
+  let rendered = "";
+  output.on("data", (chunk: Buffer) => {
+    rendered += chunk.toString();
+  });
+  const lineInput = new LineInput({
+    input,
+    output,
+    suggestions: (line, dimensions, selected) => ({
+      lines: renderSlashCommandMenu(line, { ...dimensions, theme, selected }),
+      values: slashCommandSuggestions(line).map(({ command }) => command),
+    }),
+  });
+  t.after(() => lineInput.close());
+  return { input, lineInput, output, rendered: () => rendered };
+}
+
 test("LineInput opens and filters a live slash overlay without changing the submitted line", async (t) => {
   const { calls, input, lineInput, rendered } = createLiveInput(t);
   const answer = lineInput.next("❯ ", { suggestions: true });
@@ -225,6 +269,48 @@ test("LineInput opens and filters a live slash overlay without changing the subm
     () => hasEraseSequence(rendered().slice(beforeEnter)),
     "Enter should remove the menu before returning the line",
   );
+});
+
+test("LineInput arrow keys highlight slash commands and Enter submits the selection", async (t) => {
+  const { input, lineInput, rendered } = createSelectableLiveInput(t);
+  const answer = lineInput.next("❯ ", { suggestions: true });
+  input.write("/");
+  await eventually(() => rendered().includes("/model"), "initial slash menu should render");
+
+  input.write("\u001b[B");
+  await eventually(() => stripAnsi(rendered()).includes("❯ /model"), "Down should highlight the first command");
+
+  input.write("\u001b[B");
+  await eventually(() => stripAnsi(rendered()).includes("❯ /login"), "a second Down should highlight /login");
+
+  input.write("\r");
+  assert.equal(await answer, "/login");
+});
+
+test("LineInput still selects when / and the first arrow arrive in one chunk", async (t) => {
+  const { input, lineInput } = createSelectableLiveInput(t);
+  const answer = lineInput.next("❯ ", { suggestions: true });
+  input.write("/\u001b[B\r");
+  assert.equal(await answer, "/model");
+});
+
+test("LineInput keeps plain Enter as a normal submit until an arrow activates the palette", async (t) => {
+  const { input, lineInput } = createSelectableLiveInput(t);
+  const answer = lineInput.next("❯ ", { suggestions: true });
+  input.write("/\r");
+  assert.equal(await answer, "/", "Enter without an explicit selection must keep the typed line");
+});
+
+test("LineInput Up from an untouched palette selects the last matching command", async (t) => {
+  const { input, lineInput, rendered } = createSelectableLiveInput(t);
+  const answer = lineInput.next("❯ ", { suggestions: true });
+  input.write("/");
+  await eventually(() => rendered().includes("/model"), "menu should render");
+
+  input.write("\u001b[A");
+  await eventually(() => stripAnsi(rendered()).includes("❯ /rename"), "Up should highlight the final command");
+  input.write("\r");
+  assert.equal(await answer, "/rename");
 });
 
 test("LineInput redraws a visible slash overlay when the terminal is resized", async (t) => {

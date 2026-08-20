@@ -39,6 +39,169 @@ const MINI_WHALE = [
   "▀██▄▄████▀ ▀█",
 ] as const;
 
+/**
+ * The DeepSeek pixel whale used by dsh-TUI's header (MIT-licensed sprite
+ * from github.com/ccch1mneyyy/dsh-TUI, src/components/Whale.tsx). The
+ * sprite is 40×25 cells in four tones (D outline, B body, L belly, W mouth,
+ * `.` transparent) and is rendered with half-block glyphs: each terminal
+ * cell packs the upper and lower sprite pixel into one `▀`/`▄` character,
+ * producing a 40×13 terminal whale with visually square pixels.
+ */
+const PIXEL_WHALE = [
+  "........................................",
+  "........................................",
+  "........................D...............",
+  ".......................DBD.......D......",
+  ".......................DBBD.....DBD.....",
+  ".......................DBBBD..DDBBD.....",
+  ".......................DBBBBDDBBBBD.....",
+  ".......DDDDDDDDD........DBBBBBBBBD......",
+  "......DBBBBBBBBBDD.......DBBBBBBBD......",
+  ".....DBBBBBBBBBBBBDD.....DBBBBBDD.......",
+  "....DBBBBBBBBBBBBBBBDD....DBBBD.........",
+  "...DDBBBBBBBBBBBBBBBBBD..DBBBBD.........",
+  "...DBBBBBBBBBBBBBBBBBBBDDBBBBBD.........",
+  "...DBBBDBBBBBBDBBBBBBBBBBBBBBBD.........",
+  "...DBBBDBBBBBBDBBBBBBBBBBBBBBD..........",
+  "...DBBBBBBBBBBBBBBBBBBBBBBBBBD..........",
+  "...DBBBBWWWWWWWBBBBBBBBDBBBBD...........",
+  "...DDBWWWWWWWWWWWWBBBBBBDBBBD...........",
+  "....DLLWWWWWWWWWWWWDBBBBDDBD............",
+  ".....DLLLWWWWWWWWWWDBBBBBDD.............",
+  "......DDLLLWWWWWWLLLDBBBBBDD............",
+  "........DLLLLLLLLLLLDDBBBBBBD...........",
+  ".........DDDDDDDDDDD..DDDDDDD...........",
+  "........................................",
+  "........................................",
+] as const;
+
+type Rgb = readonly [number, number, number];
+
+interface PixelColor {
+  readonly foregroundCode: string;
+  readonly backgroundCode: string;
+}
+
+const PIXEL_OUTLINE_RGB: Rgb = [20, 38, 96];
+const PIXEL_BELLY_RGB: Rgb = [190, 225, 255];
+const PIXEL_MOUTH_RGB: Rgb = [255, 255, 255];
+
+const PIXEL_RESET = "\u001b[0m";
+const PIXEL_DEFAULT_BACKGROUND = "\u001b[49m";
+
+function rgbColor(prefix: "38" | "48", rgb: Rgb): string {
+  return `\u001b[${prefix};2;${rgb[0]};${rgb[1]};${rgb[2]}m`;
+}
+
+function ansi256Color(prefix: "38" | "48", color: number): string {
+  return `\u001b[${prefix};5;${String(color)}m`;
+}
+
+function pixelPalette(theme: Theme): Record<"D" | "B" | "L" | "W", PixelColor> | undefined {
+  if (!theme.enabled) return undefined;
+  const bodyOpen = /\u001b\[[0-9;]*m/u.exec(theme.blue(""))?.[0] ?? "";
+  const truecolor = bodyOpen.includes("38;2");
+  const ansi256 = bodyOpen.includes("38;5");
+
+  if (truecolor) {
+    const body = bodyOpen;
+    return {
+      D: {
+        foregroundCode: rgbColor("38", PIXEL_OUTLINE_RGB),
+        backgroundCode: rgbColor("48", PIXEL_OUTLINE_RGB),
+      },
+      B: {
+        foregroundCode: body,
+        backgroundCode: body.replace("38", "48"),
+      },
+      L: {
+        foregroundCode: rgbColor("38", PIXEL_BELLY_RGB),
+        backgroundCode: rgbColor("48", PIXEL_BELLY_RGB),
+      },
+      W: {
+        foregroundCode: rgbColor("38", PIXEL_MOUTH_RGB),
+        backgroundCode: rgbColor("48", PIXEL_MOUTH_RGB),
+      },
+    };
+  }
+
+  if (ansi256) {
+    const body = bodyOpen;
+    return {
+      D: {
+        foregroundCode: ansi256Color("38", 17),
+        backgroundCode: ansi256Color("48", 17),
+      },
+      B: {
+        foregroundCode: body,
+        backgroundCode: body.replace("38", "48"),
+      },
+      L: {
+        foregroundCode: ansi256Color("38", 153),
+        backgroundCode: ansi256Color("48", 153),
+      },
+      W: {
+        foregroundCode: ansi256Color("38", 231),
+        backgroundCode: ansi256Color("48", 231),
+      },
+    };
+  }
+
+  // ANSI-16 terminals keep the foreground-only whale so old terminals do
+  // not end up with palette-colored rectangles behind the half blocks.
+  return undefined;
+}
+
+type PixelPalette = Record<"D" | "B" | "L" | "W", PixelColor>;
+
+function pixelCell(palette: PixelPalette, value: string | undefined): PixelColor | undefined {
+  if (value === undefined || value === ".") return undefined;
+  return palette[value as "D" | "B" | "L" | "W"];
+}
+
+function renderPixelWhale(theme: Theme): readonly string[] | undefined {
+  const palette = pixelPalette(theme);
+  if (!palette) return undefined;
+  const rows: string[] = [];
+  for (let row = 0; row < PIXEL_WHALE.length; row += 2) {
+    const upper = PIXEL_WHALE[row] ?? "";
+    const lower = PIXEL_WHALE[row + 1] ?? "";
+    let output = "";
+    let currentSequence = "";
+    for (let column = 0; column < upper.length; column += 1) {
+      const upperCell = pixelCell(palette, upper[column]);
+      const lowerCell = pixelCell(palette, lower[column]);
+      let sequence: string;
+      let glyph: string;
+      if (upperCell !== undefined && lowerCell !== undefined) {
+        sequence = `${upperCell.foregroundCode}${lowerCell.backgroundCode}`;
+        glyph = "▀";
+      } else if (upperCell !== undefined) {
+        // `▀` paints the foreground in its upper half; reset the lower
+        // background so it cannot inherit the previous cell's color.
+        sequence = `${upperCell.foregroundCode}${PIXEL_DEFAULT_BACKGROUND}`;
+        glyph = "▀";
+      } else if (lowerCell !== undefined) {
+        // `▄` paints the foreground in its lower half; reset the upper
+        // background so it cannot inherit the previous cell's color.
+        sequence = `${lowerCell.foregroundCode}${PIXEL_DEFAULT_BACKGROUND}`;
+        glyph = "▄";
+      } else {
+        sequence = "";
+        glyph = " ";
+      }
+      if (sequence !== currentSequence) {
+        output += sequence === "" ? PIXEL_RESET : sequence;
+        currentSequence = sequence;
+      }
+      output += glyph;
+    }
+    const trimmed = output.replace(/[ ]+$/u, "");
+    rows.push(trimmed.endsWith(PIXEL_RESET) ? trimmed : `${trimmed}${PIXEL_RESET}`);
+  }
+  return rows;
+}
+
 export interface LogoOptions {
   /** Maximum number of terminal columns available to the logo. */
   columns?: number;
@@ -53,7 +216,7 @@ export interface WelcomeScreenOptions extends LogoOptions {
   username?: string;
 }
 
-type CellTone = "normal" | "muted" | "blue" | "heading" | "whale";
+type CellTone = "normal" | "muted" | "blue" | "heading" | "whale" | "raw";
 
 interface Cell {
   text: string;
@@ -141,6 +304,8 @@ function styleCell(theme: Theme, cell: Cell, width: number): string {
       return theme.bold(theme.brightBlue(value));
     case "whale":
       return styleWhale(theme, value);
+    case "raw":
+      return value;
     default:
       return value;
   }
@@ -233,10 +398,12 @@ export function renderWelcomeScreen(theme: Theme, options: WelcomeScreenOptions)
     const leftWidth = Math.floor((innerWidth - 1) * 0.56);
     const hasDetailedWhaleSpace =
       width >= 104 && options.rows !== undefined && Number.isFinite(options.rows) && options.rows >= 24;
-    const whale = hasDetailedWhaleSpace ? DETAILED_WHALE : LARGE_WHALE;
+    const pixelWhale = renderPixelWhale(theme);
+    const whale = pixelWhale ?? (hasDetailedWhaleSpace ? DETAILED_WHALE : LARGE_WHALE);
+    const whaleTone: CellTone = pixelWhale ? "raw" : "whale";
     const left: Cell[] = [
       { text: `Welcome back, ${username}!`, align: "center", tone: "normal" },
-      ...whale.map((text): Cell => ({ text, align: "center", tone: "whale" })),
+      ...whale.map((text): Cell => ({ text, align: "center", tone: whaleTone })),
       { text: `${options.model} · ${apiStatus}`, align: "center", tone: "muted" },
       { text: compactPath(options.cwd), align: "center", tone: "muted" },
     ];

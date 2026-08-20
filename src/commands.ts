@@ -32,6 +32,8 @@ export interface SlashCommandMenuOptions {
   columns: number;
   rows: number;
   theme: Theme;
+  /** Index into the full matching command list, or -1 for no highlight. */
+  selected?: number;
 }
 
 export const SLASH_COMMAND_DEFINITIONS: readonly SlashCommandDefinition[] = [
@@ -143,22 +145,54 @@ export function renderSlashCommandMenu(line: string, options: SlashCommandMenuOp
   const maxItems = Math.max(1, Math.min(5, Math.floor((rows - 3) / 2)));
   const suggestions = slashCommandSuggestions(line);
   if (suggestions.length === 0) return [];
-  const visible = suggestions.slice(0, maxItems);
-  const hidden = suggestions.length - visible.length;
+
+  const requestedSelected = options.selected;
+  const selected =
+    requestedSelected === undefined || !Number.isFinite(requestedSelected)
+      ? -1
+      : Math.max(-1, Math.min(suggestions.length - 1, Math.floor(requestedSelected)));
+  const start =
+    selected < 0
+      ? 0
+      : selected < maxItems
+        ? 0
+        : Math.max(0, Math.min(selected - maxItems + 1, suggestions.length - maxItems));
+  const visible = suggestions.slice(start, start + maxItems);
+  const hiddenBefore = start;
+  const hiddenAfter = suggestions.length - start - visible.length;
 
   const rendered = [options.theme.muted("─".repeat(columns))];
   const commandWidth = Math.min(12, Math.max(...visible.map(({ command }) => command.length)) + 2);
-  for (const { command, description } of visible) {
+  for (let index = 0; index < visible.length; index += 1) {
+    const definition = visible[index];
+    if (!definition) continue;
+    const isSelected = selected === start + index;
+    const { command, description } = definition;
+    const commandText = (): string => options.theme.brightBlue(command);
+    const highlightedCommand = (): string => options.theme.bold(options.theme.brightBlue(command));
     if (columns < 44) {
-      rendered.push(`  ${options.theme.brightBlue(clipText(command, columns - 2))}`);
+      const clipped = clipText(command, columns - 2);
+      const styled = isSelected
+        ? options.theme.bold(options.theme.brightBlue(clipped))
+        : options.theme.brightBlue(clipped);
+      rendered.push(`${isSelected ? options.theme.brightBlue("❯ ") : "  "}${styled}`);
       continue;
     }
     const descriptionWidth = Math.max(1, columns - commandWidth - 3);
+    const commandPadding = " ".repeat(Math.max(0, commandWidth - command.length));
     rendered.push(
-      `  ${options.theme.brightBlue(command.padEnd(commandWidth))} ${options.theme.muted(clipText(description, descriptionWidth))}`,
+      `${isSelected ? options.theme.brightBlue("❯ ") : "  "}${isSelected ? highlightedCommand() : commandText()}${commandPadding} ${options.theme.muted(clipText(description, descriptionWidth))}`,
     );
   }
-  if (hidden > 0) rendered.push(`${options.theme.muted(`... ${String(hidden)} more`)}`);
+  if (hiddenBefore > 0 || hiddenAfter > 0) {
+    const overflow =
+      hiddenBefore > 0 && hiddenAfter > 0
+        ? `↑ ${String(hiddenBefore)} · ... ${String(hiddenAfter)} more`
+        : hiddenBefore > 0
+          ? `↑ ${String(hiddenBefore)} more`
+          : `... ${String(hiddenAfter)} more`;
+    rendered.push(options.theme.muted(overflow));
+  }
   return rendered;
 }
 
@@ -185,7 +219,8 @@ export function commandHelp(): string {
     "  /dsh [install|start|open|status|stop|logs|restart]  管理官方 DSH Web",
     "  /exit                  保存并退出（也可按 Ctrl+C）",
     "",
-    "菜单提示：列出选项时可用 ↑/↓ 选择、Enter 确认、Esc 取消，",
+    "菜单提示：主提示符输入 / 后可用 ↑/↓ 选择命令、Enter 执行；",
+    "        其他选项列表也支持 ↑/↓ 选择、Enter 确认、Esc 取消，",
     "        数字可直接跳转；/model 菜单还可以直接输入自定义模型 ID。",
     "提示：输入 // 开头可把 / 当作普通消息发送。",
   ].join("\n");

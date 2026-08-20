@@ -22,12 +22,28 @@ export interface LineInputNextOptions {
   suggestions?: boolean;
 }
 
-type SuggestionProvider = (line: string, size: TerminalSize) => readonly string[];
+export interface SuggestionMenu {
+  lines: readonly string[];
+  /**
+   * Values for the selectable rows. When present, Up/Down move through
+   * these values while the overlay is visible and Enter can confirm the
+   * highlighted value as the submitted line.
+   */
+  values?: readonly string[];
+}
+
+type SuggestionProvider = (
+  line: string,
+  size: TerminalSize,
+  selectedIndex: number,
+) => SuggestionMenu | readonly string[];
 type ResizeHandler = (size: TerminalSize) => void;
 
 interface Keypress {
-  name?: string;
+  name?: string | undefined;
   ctrl?: boolean;
+  sequence?: string;
+  code?: string;
 }
 
 const PASTE_START = "\u001b[200~";
@@ -174,6 +190,9 @@ export class LineInput {
   private menuCapacity = 0;
   private promptEpoch = 0;
   private refreshQueued = false;
+  private suggestionLine: string | undefined;
+  private suggestionSelection = -1;
+  private suggestionValues: readonly string[] = [];
   onInterrupt?: () => void;
 
   constructor(options: {
@@ -207,17 +226,68 @@ export class LineInput {
   private readonly handleKeypress = (_character: string | undefined, key: Keypress = {}): void => {
     if (!this.suggestionsActive || this.closed) return;
     if (key.name === "escape") {
+      this.suggestionSelection = -1;
+      this.suggestionValues = [];
       this.dismissedLine = this.interface.line;
       this.eraseMenuFromPrompt();
       return;
     }
     if (key.name === "return" || key.name === "enter" || (key.ctrl && key.name === "c")) {
+      if (!key.ctrl) this.confirmSuggestionIntoLine();
       this.promptEpoch += 1;
       this.eraseMenuFromPrompt();
       return;
     }
+    if (key.name === "up" || key.name === "down") {
+      if (this.dismissedLine !== this.interface.line) {
+        if (this.suggestionValues.length === 0 && this.suggestions) {
+          const menu = this.normalizeSuggestion(this.suggestions(this.interface.line, this.terminalSize(), -1));
+          this.suggestionValues = menu.values ?? [];
+          this.suggestionLine = this.interface.line;
+        }
+        if (this.suggestionValues.length > 0) {
+          this.moveSuggestionSelection(key.name);
+          // readline normally sends bare Up/Down to history navigation. The
+          // command palette owns those keys while it is visible, so mutate
+          // the event object before readline's own keypress listener runs.
+          key.name = undefined;
+          key.sequence = "";
+          key.code = "";
+          this.scheduleSuggestionRefresh();
+          return;
+        }
+      }
+    }
     this.scheduleSuggestionRefresh();
   };
+
+  private moveSuggestionSelection(direction: "up" | "down"): void {
+    const count = this.suggestionValues.length;
+    if (count === 0) {
+      this.suggestionSelection = -1;
+      return;
+    }
+    if (this.suggestionSelection < 0) {
+      this.suggestionSelection = direction === "up" ? count - 1 : 0;
+      return;
+    }
+    this.suggestionSelection =
+      direction === "up"
+        ? Math.max(0, this.suggestionSelection - 1)
+        : Math.min(count - 1, this.suggestionSelection + 1);
+  }
+
+  private confirmSuggestionIntoLine(): void {
+    const index = this.suggestionSelection;
+    if (index < 0 || index >= this.suggestionValues.length) return;
+    const value = this.suggestionValues[index];
+    if (value === undefined || this.interface.line === value) return;
+    // readline's own keypress listener runs immediately after this
+    // prepended one and will submit whatever is in `interface.line`.
+    const editable = this.interface as unknown as { line: string; cursor: number };
+    editable.line = value;
+    editable.cursor = value.length;
+  }
 
   private readonly handleResize = (): void => {
     if (!this.suggestionsActive || this.closed) return;
@@ -262,7 +332,23 @@ export class LineInput {
       this.eraseMenuFromPrompt();
       return;
     }
-    this.paintMenu([...this.suggestions(this.interface.line, this.terminalSize())]);
+    const line = this.interface.line;
+    if (this.suggestionLine !== line) {
+      this.suggestionLine = line;
+      this.suggestionSelection = -1;
+    }
+    let menu = this.normalizeSuggestion(this.suggestions(line, this.terminalSize(), this.suggestionSelection));
+    this.suggestionValues = menu.values ?? [];
+    if (this.suggestionSelection >= this.suggestionValues.length) {
+      this.suggestionSelection = this.suggestionValues.length > 0 ? this.suggestionValues.length - 1 : -1;
+      menu = this.normalizeSuggestion(this.suggestions(line, this.terminalSize(), this.suggestionSelection));
+      this.suggestionValues = menu.values ?? [];
+    }
+    this.paintMenu([...menu.lines]);
+  }
+
+  private normalizeSuggestion(result: SuggestionMenu | readonly string[]): SuggestionMenu {
+    return (Array.isArray(result) ? { lines: result } : result) as SuggestionMenu;
   }
 
   private allocateMenuRows(capacity: number): void {
@@ -340,6 +426,9 @@ export class LineInput {
       this.suggestionsActive = false;
       this.dismissedLine = undefined;
       this.menuCapacity = 0;
+      this.suggestionLine = undefined;
+      this.suggestionSelection = -1;
+      this.suggestionValues = [];
       line = this.restorePastes(line);
       const waiter = this.waiters.shift();
       if (waiter) waiter(line);
@@ -371,6 +460,9 @@ export class LineInput {
     this.suggestionsActive = options.suggestions ?? false;
     this.dismissedLine = undefined;
     this.menuCapacity = 0;
+    this.suggestionLine = undefined;
+    this.suggestionSelection = -1;
+    this.suggestionValues = [];
     this.interface.setPrompt(prompt);
     this.interface.prompt();
     return await new Promise<string | undefined>((resolve) => this.waiters.push(resolve));
@@ -398,6 +490,9 @@ export class LineInput {
     this.promptEpoch += 1;
     this.menuCapacity = 0;
     this.suggestionsActive = false;
+    this.suggestionLine = undefined;
+    this.suggestionSelection = -1;
+    this.suggestionValues = [];
     this.suspending = true;
     this.interface.close();
     this.suspending = false;

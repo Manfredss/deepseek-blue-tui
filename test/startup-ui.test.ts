@@ -120,6 +120,16 @@ function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+function assertHasPixelWhale(rendered: string, background = "\u001b[48;2;77;107;254m"): void {
+  assert.match(rendered, /▀/u, "half-block whale should contain upper-half glyphs");
+  assert.match(rendered, /▄/u, "half-block whale should contain lower-half glyphs");
+  assert.ok(rendered.includes(background), `pixel whale should paint its body background, expected ${JSON.stringify(background)}`);
+}
+
+function assertHasNoLegacyWhiteBackground(rendered: string): void {
+  assert.doesNotMatch(rendered, /\u001b\[(?:47|107)m/u, "welcome screen must not fill the terminal with a legacy white background");
+}
+
 function assertHasBlueWhaleInk(rendered: string, blue = DEEPSEEK_BLUE): void {
   const blueWhaleInk = new RegExp(
     `${escapeRegExp(blue)}(?:(?!\\u001b\\[0m)[\\s\\S])*?[▄█▀●]`,
@@ -146,29 +156,30 @@ test("plain startup UI never leaks ANSI sequences", () => {
   assert.match(rendered, /Wenfei Qi/);
 });
 
-test("welcome screen uses foreground styling only", () => {
+test("welcome screen renders the dsh-style half-block pixel whale in true color", () => {
   const rendered = renderWelcomeScreen(createTrueColorTheme(), { ...welcomeOptions, columns: 93 });
 
   assert.ok(rendered.includes(DEEPSEEK_BLUE));
-  assertHasNoBackgroundSgr(rendered);
-  assertHasBlueWhaleInk(rendered);
+  assertHasPixelWhale(rendered);
+  assertHasNoLegacyWhiteBackground(rendered);
 });
 
-test("Apple Terminal uses the 256-color DeepSeek blue fallback without a white background", () => {
+test("Apple Terminal uses the 256-color DeepSeek blue fallback without a legacy white background", () => {
   const theme = createTheme(true, {
     TERM: "xterm-256color",
     TERM_PROGRAM: "Apple_Terminal",
   });
-  const rendered = [
-    renderLogo(theme, { columns: 93 }),
-    renderWelcomeScreen(theme, { ...welcomeOptions, columns: 93 }),
-  ].join("\n");
+  const logo = renderLogo(theme, { columns: 93 });
+  const welcome = renderWelcomeScreen(theme, { ...welcomeOptions, columns: 93 });
 
-  assert.ok(rendered.includes(DEEPSEEK_BLUE_256));
-  assert.equal(rendered.includes(DEEPSEEK_BLUE), false);
-  assert.equal(rendered.includes("\u001b[107m"), false);
-  assertHasNoBackgroundSgr(rendered);
-  assertHasBlueWhaleInk(rendered, DEEPSEEK_BLUE_256);
+  assert.ok(logo.includes(DEEPSEEK_BLUE_256));
+  assert.ok(welcome.includes(DEEPSEEK_BLUE_256));
+  assert.equal(welcome.includes(DEEPSEEK_BLUE), false);
+  assert.equal(welcome.includes("\u001b[107m"), false);
+  assertHasNoBackgroundSgr(logo);
+  assertHasPixelWhale(welcome, "\u001b[48;5;63m");
+  assertHasNoLegacyWhiteBackground(welcome);
+  assertHasBlueWhaleInk(logo, DEEPSEEK_BLUE_256);
 });
 
 test("logo and welcome screen fit common and narrow terminal widths", () => {
