@@ -240,13 +240,19 @@ export async function installDsh(options: InstallDshOptions = {}): Promise<Insta
   }
 
   const npm = process.platform === "win32" ? "npm.cmd" : "npm";
-  const prefixResult = spawnImpl(npm, ["config", "get", "prefix"], { encoding: "utf8", env, timeout: 30_000 });
+  const shell = process.platform === "win32";
+  const prefixResult = spawnImpl(npm, ["config", "get", "prefix"], {
+    encoding: "utf8",
+    env,
+    timeout: 30_000,
+    shell,
+  });
   const prefix = prefixResult.status === 0 ? prefixResult.stdout.trim() : "";
   const spec = `@deepseek-ai/dsh@${version}`;
   const installResult = spawnImpl(
     npm,
     ["install", "--global", "--no-fund", "--no-audit", spec],
-    { stdio: "inherit", env, timeout: 10 * 60_000 },
+    { stdio: "inherit", env, timeout: 10 * 60_000, shell },
   );
   if (installResult.error) throw new Error(`无法运行 npm：${installResult.error.message}`);
   if (installResult.status !== 0) throw new Error(`DSH 安装失败（npm 退出码 ${installResult.status}）`);
@@ -339,12 +345,16 @@ export class DshManager {
     await rotateLogIfNeeded(this.logPath);
     const logDescriptor = openSync(this.logPath, "a", 0o600);
     const args = [...command.argsPrefix, "web", "--host", "127.0.0.1", "--port", String(port)];
+    // Node on Windows cannot CreateProcess a .cmd/.bat shim directly;
+    // hand those to cmd.exe through the `shell` option.
+    const windowsShellCommand = process.platform === "win32" && /\.(?:cmd|bat)$/i.test(command.command);
     const child = spawn(command.command, args, {
       cwd: options.cwd ?? process.cwd(),
       detached: true,
       stdio: ["ignore", logDescriptor, logDescriptor],
       env: dshChildEnvironment(),
       windowsHide: true,
+      ...(windowsShellCommand ? { shell: true } : {}),
     });
     try {
       await new Promise<void>((resolveSpawn, rejectSpawn) => {
@@ -392,11 +402,23 @@ export class DshManager {
     if (!looksLikeDsh(state.pid, this.psImpl)) {
       throw new Error(`PID ${state.pid} 与 DSH 不匹配；为避免误杀，拒绝停止`);
     }
-    const targetPid = process.platform === "win32" ? state.pid : -state.pid;
-    process.kill(targetPid, "SIGTERM");
+    if (process.platform === "win32") {
+      // The recorded PID is cmd.exe when DSH was launched through a
+      // .cmd shim; taskkill /T terminates the wrapper and the Node child.
+      const killed = spawnSync("taskkill", ["/pid", String(state.pid), "/T", "/F"], {
+        stdio: "ignore",
+        windowsHide: true,
+      });
+      if (killed.error) throw new Error(`无法停止 Windows DSH 进程：${killed.error.message}`);
+    } else {
+      process.kill(-state.pid, "SIGTERM");
+    }
     const deadline = Date.now() + 6_000;
     while (Date.now() < deadline && pidAlive(state.pid)) await delay(100);
-    if (pidAlive(state.pid)) process.kill(targetPid, "SIGKILL");
+    if (pidAlive(state.pid)) {
+      if (process.platform === "win32") process.kill(state.pid);
+      else process.kill(-state.pid, "SIGKILL");
+    }
     await unlink(this.statePath).catch(() => undefined);
     return { stopped: true, message: `DSH 已停止 (PID ${state.pid})` };
   }

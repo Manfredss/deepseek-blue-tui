@@ -35,7 +35,7 @@ test("resolveAppHome honors explicit and XDG homes", () => {
   assert.equal(resolveAppHome({ XDG_CONFIG_HOME: "/tmp/xdg" }), join("/tmp/xdg", "deepseek-tui"));
   assert.equal(
     resolveAppHome({ DEEPSEEK_TUI_HOME: "/tmp/deepseek", XDG_CONFIG_HOME: "/tmp/ignored" }),
-    "/tmp/deepseek",
+    resolve("/tmp/deepseek"),
   );
 });
 
