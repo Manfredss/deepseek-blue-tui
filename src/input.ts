@@ -679,6 +679,9 @@ export class MenuPicker {
 
         if (character === "\u001b") {
           this.escapeBuffer = "\u001b";
+          // Keep this timeout referenced: on CI runners (notably Node 22)
+          // an unref'ed timer is the only remaining handle after a lone
+          // Escape, so the test runner cancels the still-pending picker.
           this.escapeTimer = setTimeout(() => {
             this.escapeTimer = undefined;
             if (this.escapeBuffer === "\u001b" && !this.settled) {
@@ -686,7 +689,6 @@ export class MenuPicker {
               settle(undefined);
             }
           }, ESCAPE_TIMEOUT_MS);
-          this.escapeTimer.unref();
           continue;
         }
         if (character === "\r" || character === "\n") {
