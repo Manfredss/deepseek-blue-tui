@@ -31,7 +31,25 @@ jobs:
       # Static check + unit tests + the cross-platform DSH lifecycle
       # integration test (stub DSH on every OS).
       - name: Typecheck and tests
-        run: npm run check
+        shell: pwsh
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP 'check.log'
+          npm run check *>&1 | Tee-Object -FilePath $log
+          $status = $LASTEXITCODE
+          if ($status -ne 0) {
+            node -e '
+              const fs = require("node:fs");
+              const path = require("node:path");
+              const text = fs.readFileSync(path.join(process.env.RUNNER_TEMP, "check.log"), "utf8");
+              const lines = text.split(/\r?\n/);
+              const interesting = lines.filter((line) => /^(not ok|# (tests|pass|fail|cancelled|skipped))|AssertionError|Promise resolution|Error:|MODULE_NOT_FOUND|Cannot find/i.test(line));
+              for (const line of interesting.slice(-120)) {
+                const safe = line.replace(/%/g, "%25").replace(/:/g, "%3A").replace(/\r/g, "%0D");
+                console.log(`::error title=ci-check-log::${safe}`);
+              }
+            '
+          }
+          exit $status
 
       - name: Build
         run: npm run build
