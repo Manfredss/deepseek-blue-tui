@@ -1,7 +1,7 @@
 import { homedir, platform } from "node:os";
 import { join, resolve } from "node:path";
 import { readFile } from "node:fs/promises";
-import { DEFAULT_CONFIG, type AppConfig } from "./types.js";
+import { DEFAULT_CONFIG, REASONING_EFFORTS, type AppConfig, type ReasoningEffort } from "./types.js";
 import { isRecord, writeJsonAtomic } from "./fs-utils.js";
 
 export function resolveAppHome(env: NodeJS.ProcessEnv = process.env): string {
@@ -19,6 +19,10 @@ function validPort(value: unknown): value is number {
 
 function validContextLimit(value: unknown): value is number {
   return Number.isInteger(value) && Number(value) >= 4_096 && Number(value) <= 1_048_576;
+}
+
+export function isValidEffort(value: unknown): value is ReasoningEffort {
+  return typeof value === "string" && (REASONING_EFFORTS as readonly string[]).includes(value);
 }
 
 export function isValidBaseUrl(value: string): boolean {
@@ -44,6 +48,7 @@ export function normalizeConfig(value: unknown): AppConfig {
     contextLimitTokens: validContextLimit(value.contextLimitTokens)
       ? value.contextLimitTokens
       : DEFAULT_CONFIG.contextLimitTokens,
+    effort: isValidEffort(value.effort) ? value.effort : DEFAULT_CONFIG.effort,
   };
   if (typeof value.apiKey === "string" && value.apiKey.trim()) config.apiKey = value.apiKey.trim();
   return config;

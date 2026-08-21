@@ -111,9 +111,9 @@ test("slash menu highlights the selected command and scrolls to later matches", 
   assert.ok(scrolledPlain.some((line) => line.includes("❯ /status")), "selected command should be in the visible window");
   assert.ok(!scrolledPlain.some((line) => line.includes("/model")), "commands scrolled out above should be hidden");
   assert.match(scrolledPlain.at(-1) ?? "", /↑ 3/);
-  assert.match(scrolledPlain.at(-1) ?? "", /14 more/);
+  assert.match(scrolledPlain.at(-1) ?? "", new RegExp(`${String(SLASH_COMMANDS.length - 6)} more`));
 
-  const last = renderSlashCommandMenu("/", { columns: 60, rows: 10, theme, selected: 19 });
+  const last = renderSlashCommandMenu("/", { columns: 60, rows: 10, theme, selected: SLASH_COMMANDS.length - 1 });
   assert.ok(last.some((line) => stripAnsi(line).includes("❯ /rename")), "final command should be reachable");
   assert.ok(last.every((line) => visibleWidth(line) <= 60), "selected/scroll rows must stay within the viewport");
 });

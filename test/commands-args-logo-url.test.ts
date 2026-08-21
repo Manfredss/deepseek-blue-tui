@@ -89,6 +89,15 @@ test("parseCliArgs parses chat flags and joins prompt words", () => {
   );
 });
 
+test("parseCliArgs parses --effort into options for later validation", () => {
+  assert.deepEqual(parseCliArgs(["--effort", "low", "hello"]), {
+    ...parseCliArgs([]),
+    effort: "low",
+    prompt: "hello",
+  });
+  assert.throws(() => parseCliArgs(["--effort"]), /--effort 需要一个值/);
+});
+
 test("parseCliArgs handles subcommands, resume forms, and option terminator", () => {
   assert.deepEqual(parseCliArgs(["dsh", "start", "--port", "4000"]), {
     ...parseCliArgs([]),

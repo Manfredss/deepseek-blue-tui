@@ -32,6 +32,16 @@ export interface Session {
   lastCompletionTokens?: number;
 }
 
+export type ReasoningEffort = "low" | "high" | "max";
+
+export const REASONING_EFFORTS: readonly ReasoningEffort[] = ["low", "high", "max"] as const;
+
+export const REASONING_EFFORT_LABELS: Record<ReasoningEffort, string> = {
+  low: "快速响应，较少推理（适合简单任务）",
+  high: "默认档，深度思考",
+  max: "极限推理（更慢、消耗更多 Token）",
+};
+
 export interface AppConfig {
   version: 1;
   model: string;
@@ -40,6 +50,8 @@ export interface AppConfig {
   showReasoning: boolean;
   dshPort: number;
   contextLimitTokens: number;
+  /** DeepSeek V4 thinking effort (OpenAI format: low/high/max). */
+  effort: ReasoningEffort;
 }
 
 export interface BalanceInfo {
@@ -65,6 +77,7 @@ export const DEFAULT_CONFIG: AppConfig = {
   showReasoning: false,
   dshPort: 3080,
   contextLimitTokens: 131_072,
+  effort: "high",
 };
 
 export const RECOMMENDED_MODELS = [

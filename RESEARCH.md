@@ -79,6 +79,17 @@ DeepSeek 的[多轮对话指南](https://api-docs.deepseek.com/guides/multi_roun
 
 实现还会保存 assistant 的 `reasoning_content`，并在后续请求中回传；当前[官方 Thinking Mode 文档](https://api-docs.deepseek.com/guides/thinking_mode)说明无工具调用时该字段会被忽略，而工具调用链要求完整回传。显示与保存是两个概念：`/thinking` 只决定终端是否展示思考过程，隐藏时仍可能被 API 返回并保存在会话中。
 
+### 思考强度（reasoning_effort）
+
+[官方 Thinking Mode 指南](https://api-docs.deepseek.com/guides/thinking_mode)确认 DeepSeek V4（flash 与 pro 相同）在 OpenAI 格式下支持：
+
+- 开关：`thinking: {type: "enabled"|"disabled"}`；思考模式**默认开启**
+- 强度：`reasoning_effort: "low"|"high"|"max"`，**默认 high**
+- 官方映射表：`low→low`、`medium→high`、`high→high`、`xhigh→high`、`max→max`（`medium`/`xhigh` 只是别名，实际都落到 high）
+- 思考模式忽略 `temperature`/`top_p` 等采样参数
+
+因此 `/effort` 只暴露 `low`/`high`/`max` 三个真实档位，不提供会静默合并的 `medium`；请求只发送 `reasoning_effort`（thinking 已默认开启）。本项目 `config.effort` 默认 `high`，与官方默认一致。
+
 流式实现遵守官方 `stream_options.include_usage` 语义：用量 chunk 可能没有 choices；SSE 的 `[DONE]`、keep-alive 注释和不完整分块都需要容错。
 
 ## DSH 调研

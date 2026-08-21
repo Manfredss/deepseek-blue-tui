@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import { resolve } from "node:path";
 import { realpathSync } from "node:fs";
 import { parseCliArgs, cliHelp } from "./args.js";
-import { ConfigStore, isValidBaseUrl, maskApiKey } from "./config.js";
+import { ConfigStore, isValidBaseUrl, isValidEffort, maskApiKey } from "./config.js";
 import {
   SessionStore,
   addUsage,
@@ -93,6 +93,7 @@ export async function runOneShot(options: {
         baseUrl: runtime.baseUrl,
         model: session.model,
         messages: truncateForSend(session, options.config.contextLimitTokens, stderr),
+        effort: options.config.effort,
         signal: controller.signal,
         onReasoning: (delta) => {
           reasoning += delta;
@@ -321,6 +322,10 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       config.baseUrl = baseUrl;
     }
     if (options.showReasoning) config.showReasoning = true;
+    if (options.effort) {
+      if (!isValidEffort(options.effort)) throw new Error("--effort 必须是 low、high 或 max");
+      config.effort = options.effort;
+    }
 
     if (options.command === "login") await standaloneLogin(configStore, config);
     else if (options.command === "usage") await standaloneUsage(configStore, config, options.commandArgs);

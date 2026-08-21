@@ -57,6 +57,7 @@ test("normalizeConfig trims valid values and sanitizes invalid fields", () => {
       showReasoning: true,
       dshPort: 65_535,
       contextLimitTokens: 200_000,
+      effort: "low",
     }),
     {
       version: 1,
@@ -66,6 +67,7 @@ test("normalizeConfig trims valid values and sanitizes invalid fields", () => {
       showReasoning: true,
       dshPort: 65_535,
       contextLimitTokens: 200_000,
+      effort: "low",
     },
   );
 
@@ -89,6 +91,7 @@ test("ConfigStore round-trips normalized configuration and supplies defaults", a
     showReasoning: true,
     dshPort: 4444,
     contextLimitTokens: 256_000,
+    effort: "max",
   });
 
   assert.deepEqual(await store.load(), {
@@ -99,6 +102,7 @@ test("ConfigStore round-trips normalized configuration and supplies defaults", a
     showReasoning: true,
     dshPort: 4444,
     contextLimitTokens: 256_000,
+    effort: "max",
   });
   const serialized = await readFile(store.configPath, "utf8");
   assert.equal(serialized.endsWith("\n"), true);
@@ -124,6 +128,15 @@ test("ConfigStore reports malformed JSON and applies runtime environment overrid
     () => store.runtime(base, { DEEPSEEK_BASE_URL: "ssh://proxy.example" }),
     /DEEPSEEK_BASE_URL 必须是有效的 http\(s\) URL/,
   );
+});
+
+test("normalizeConfig accepts only real DeepSeek effort levels", () => {
+  assert.equal(normalizeConfig({ effort: "low" }).effort, "low");
+  assert.equal(normalizeConfig({ effort: "max" }).effort, "max");
+  assert.equal(normalizeConfig({ effort: "medium" }).effort, "high", "medium is not an OpenAI-format value");
+  assert.equal(normalizeConfig({ effort: "extreme" }).effort, "high");
+  assert.equal(normalizeConfig({ effort: 7 }).effort, "high");
+  assert.equal(normalizeConfig({}).effort, "high");
 });
 
 test("maskApiKey reveals only a small identifying prefix and suffix", () => {

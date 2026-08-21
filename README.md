@@ -21,6 +21,7 @@ Co-authored by Deepseek Harness.
 - 可观测性：`/status` 上下文 HUD + 分段进度条 + 缓存命中率 + 最近一轮 TPS；`/context` 逐条消息 token 审计
 - 按当前工作目录保存会话，支持标题、恢复和累计 Token 统计；跨终端文件锁防止互相覆盖
 - 上下文长度估算：接近上限时预警，超限时自动裁剪最早的普通消息（`contextLimitTokens` 可配）
+- 思考强度控制：`/effort [low|high|max]` 设置 DeepSeek V4 推理强度（默认 high，对应官方默认）
 - 隐藏输入 API Key；也可只使用环境变量，不落盘密钥
 - 后台启动、打开、检查、停止和查看官方 DSH Web 日志；日志自动轮转并按规则脱敏
 - macOS、Linux 与 Windows 的浏览器打开适配
@@ -171,6 +172,7 @@ deepseek dsh status
 | `--endpoint <URL>` | 本次启动使用自定义 OpenAI-compatible API 地址 |
 | `--base-url <URL>` | `--endpoint` 的等价写法 |
 | `--thinking` | 显示 API 返回的思考过程 |
+| `--effort <强度>` | 本次启动使用 low/high/max 思考强度 |
 | `--no-logo` | 交互模式不显示鲸鱼 |
 | `--no-color` | 交互模式不使用 ANSI 颜色 |
 | `-h, --help` | 显示帮助 |
@@ -196,6 +198,7 @@ deepseek dsh status
 | `/resume [ID/标题]` | 浏览或匹配当前目录的历史会话 |
 | `/rename <标题>` | 重命名当前会话，最长保存 100 个字符 |
 | `/thinking [on\|off]` | 显示、隐藏或切换思考过程的可见性 |
+| `/effort [low\|high\|max]` | 无参数打开选择菜单（↑/↓ 导航）；直接传档位立即切换 |
 | `/status` | 上下文 HUD、Token/缓存/最近一轮 TPS、Endpoint、遮罩凭据与 DSH 状态 |
 | `/context` | 逐条消息的 token 估算与按角色/思考的分段构成 |
 | `/btw <问题>` | 侧问：复用当前上下文做单轮问答，不写入会话历史、不计入会话 Token |
@@ -214,6 +217,8 @@ deepseek dsh status
 会话使用文件锁防止两个终端同时写同一会话：第二个终端会提示进入只读模式（可以继续提问，但回复不落盘）。第一个终端不受影响，仍正常读写；关闭第一个终端后，新开的实例即可恢复读写。
 
 `/thinking` 和 `--thinking` 只控制是否把 API 返回的 `reasoning_content` 显示在终端，不等同于切换模型的 thinking 参数。
+
+`/effort` 控制模型真实的推理深度，直接映射到 DeepSeek V4 的 `reasoning_effort`（OpenAI 格式仅支持 `low`/`high`/`max`；传入 `medium` 会被官方映射为 `high`，因此本项目不提供该档位）。思考模式默认开启、默认强度 `high`，与官方默认一致。
 
 ## DSH 后台管理
 

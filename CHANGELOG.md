@@ -6,6 +6,7 @@
 
 ### 新增
 
+- `/effort [low|high|max]`：设置 DeepSeek V4 思考强度（无参数打开 ↑/↓ 导航菜单）；请求发送官方 `reasoning_effort`，默认 `high` 与官方默认一致；`deepseek --effort <档位>` 单次覆盖；`/status` 显示当前档位
 - 主提示符 `/` 命令菜单支持方向键选择：`↑`/`↓` 在所有匹配项中移动高亮（长列表自动滚动），`Enter` 执行高亮命令；未按方向键时 `Enter` 保持普通提交行为
 - 启动页在真彩/256 色终端采用 dsh-TUI 风格半块像素鲸鱼：40×13 终端单元格，深蓝轮廓、DeepSeek 蓝身体、冰蓝腹部与白色嘴部；ANSI-16 与纯文本模式继续使用原有前景鲸鱼
 - 选项列表支持方向键导航：`↑`/`↓` 移动高亮、`Enter` 确认、`Esc` 取消、数字跳转；`/model` 菜单支持直接键入自定义模型 ID（应用于 `/model`、`/resume`、`/rewind`、`/login` 与 `deepseek login`）

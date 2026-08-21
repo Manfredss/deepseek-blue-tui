@@ -153,6 +153,29 @@ test("streamChat sends compatible messages and aggregates reasoning, content, an
   });
 });
 
+test("streamChat includes reasoning_effort in the request body when configured", async () => {
+  let body: unknown;
+  const fetchImpl = (async (_url: string | URL | Request, init?: RequestInit) => {
+    body = JSON.parse(String(init?.body));
+    return new Response("data: [DONE]\n\n", { status: 200 });
+  }) as typeof fetch;
+  await streamChat({
+    apiKey: "key",
+    baseUrl: "https://api.example",
+    model: "deepseek-v4-pro",
+    messages: [],
+    effort: "max",
+    fetchImpl,
+  });
+  assert.deepEqual(body, {
+    model: "deepseek-v4-pro",
+    messages: [],
+    stream: true,
+    stream_options: { include_usage: true },
+    reasoning_effort: "max",
+  });
+});
+
 test("streamChat maps structured HTTP errors and safe fallback messages", async () => {
   const structuredFetch = (async () => new Response(JSON.stringify({
     error: { message: "bad credential", code: "invalid_api_key" },

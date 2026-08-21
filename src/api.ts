@@ -1,4 +1,4 @@
-import type { BalanceInfo, ChatMessage, TokenUsage } from "./types.js";
+import type { BalanceInfo, ChatMessage, ReasoningEffort, TokenUsage } from "./types.js";
 import { EMPTY_USAGE } from "./types.js";
 import { isRecord } from "./fs-utils.js";
 
@@ -39,6 +39,8 @@ export interface StreamChatOptions {
   messages: ChatMessage[];
   signal?: AbortSignal;
   timeoutMs?: number;
+  /** DeepSeek V4 thinking effort (OpenAI format: low/high/max). */
+  effort?: ReasoningEffort;
   fetchImpl?: typeof fetch;
   onContent?: (delta: string) => void;
   onReasoning?: (delta: string) => void;
@@ -218,6 +220,9 @@ export async function streamChat(options: StreamChatOptions): Promise<StreamChat
         messages: apiMessages(options.messages),
         stream: true,
         stream_options: { include_usage: true },
+        // DeepSeek V4 thinking effort: low/high/max. Thinking mode itself is
+        // enabled by default, so only the effort level needs to be sent.
+        ...(options.effort !== undefined ? { reasoning_effort: options.effort } : {}),
       }),
     }, controller.signal);
     if (!response.ok) throw await errorFromResponse(response);

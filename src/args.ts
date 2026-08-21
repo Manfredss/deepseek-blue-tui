@@ -6,6 +6,7 @@ export interface CliOptions {
   prompt?: string;
   model?: string;
   baseUrl?: string;
+  effort?: string;
   resume?: string | true;
   continueLast: boolean;
   showLogo: boolean;
@@ -61,6 +62,10 @@ export function parseCliArgs(argv: string[]): CliOptions {
       const [value, next] = takeValue(argv, index, argument);
       options.model = value;
       index = next;
+    } else if (argument === "--effort") {
+      const [value, next] = takeValue(argv, index, argument);
+      options.effort = value;
+      index = next;
     } else if (argument === "--endpoint" || argument === "--base-url") {
       const [value, next] = takeValue(argv, index, argument);
       options.baseUrl = value;
@@ -90,6 +95,7 @@ export function cliHelp(): string {
   deepseek                            启动交互终端
   deepseek "解释这个项目"             单次提问
   deepseek --model deepseek-v4-pro    指定模型
+  deepseek --effort max               思考强度 low/high/max
   deepseek --continue                 恢复当前目录最近会话
   deepseek resume [ID]                恢复指定会话
   deepseek login                      配置 API Key
@@ -103,6 +109,7 @@ export function cliHelp(): string {
 
 选项：
   -m, --model <名称>      模型名称
+      --effort <强度>     思考强度：low / high / max
   -c, --continue          恢复最近会话
   -r, --resume [ID]       选择或恢复会话
       --endpoint <URL>    OpenAI-compatible API 地址

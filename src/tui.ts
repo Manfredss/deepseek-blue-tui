@@ -1,7 +1,7 @@
 import { userInfo } from "node:os";
 import { join } from "node:path";
-import type { AppConfig, ChatMessage, Session } from "./types.js";
-import { RECOMMENDED_MODELS } from "./types.js";
+import type { AppConfig, ChatMessage, ReasoningEffort, Session } from "./types.js";
+import { REASONING_EFFORT_LABELS, REASONING_EFFORTS, RECOMMENDED_MODELS } from "./types.js";
 import { ConfigStore, maskApiKey } from "./config.js";
 import {
   addUsage,
@@ -381,6 +381,9 @@ export class DeepSeekTui {
       case "thinking":
         await this.toggleThinking(tokens[0]);
         break;
+      case "effort":
+        await this.changeEffort(tokens[0]);
+        break;
       case "status":
         await this.showStatus();
         break;
@@ -562,6 +565,33 @@ export class DeepSeekTui {
     this.line(`思考过程：${this.config.showReasoning ? this.theme.green("显示") : this.theme.muted("隐藏")}`);
   }
 
+  /** /effort — DeepSeek V4 thinking effort (low/high/max), with a menu. */
+  private async changeEffort(requested: string | undefined): Promise<void> {
+    const normalized = requested?.trim().toLocaleLowerCase();
+    let effort: ReasoningEffort | undefined;
+    if (normalized && (REASONING_EFFORTS as readonly string[]).includes(normalized)) {
+      effort = normalized as ReasoningEffort;
+    } else if (normalized) {
+      this.line(this.theme.yellow("用法：/effort [low|high|max]。medium 在 DeepSeek V4 上会映射为 high。"));
+      return;
+    } else {
+      const result = await this.runMenu({
+        title: "选择思考强度",
+        items: REASONING_EFFORTS.map(
+          (level) =>
+            `${level.padEnd(4)} ${REASONING_EFFORT_LABELS[level]}${this.config.effort === level ? " ✓" : ""}`,
+        ),
+        footer: "↑/↓ 选择 · Enter 确认 · Esc 取消 · 数字跳转",
+      });
+      if (!result || result.kind !== "index") return;
+      effort = REASONING_EFFORTS[result.index];
+    }
+    if (!effort) return;
+    this.config.effort = effort;
+    await this.configStore.save(this.config);
+    this.line(`${this.theme.green("✓")} 思考强度已设为 ${this.theme.bold(effort)}（${REASONING_EFFORT_LABELS[effort]}）`);
+  }
+
   private async showStatus(): Promise<void> {
     if (!this.session) return;
     const runtime = this.configStore.runtime(this.config);
@@ -603,6 +633,9 @@ export class DeepSeekTui {
     this.line(`${this.theme.bold("会话")}      ${this.session.id} · ${this.session.title}`);
     this.line(`${this.theme.bold("Endpoint")}  ${runtime.baseUrl}`);
     this.line(`${this.theme.bold("凭据")}      ${maskApiKey(runtime.apiKey)}${process.env.DEEPSEEK_API_KEY ? " (环境变量)" : ""}`);
+    this.line(
+      `${this.theme.bold("思考强度")}  ${this.theme.bold(this.config.effort)}${this.theme.muted(`（${REASONING_EFFORT_LABELS[this.config.effort]}）· 思考过程 ${this.config.showReasoning ? "显示" : "隐藏"}`)}`,
+    );
     const hit = this.session.usage.promptCacheHitTokens;
     const miss = this.session.usage.promptCacheMissTokens;
     const hitRate = hit + miss > 0 ? ((hit / (hit + miss)) * 100).toFixed(1) : "—";
@@ -678,6 +711,7 @@ export class DeepSeekTui {
         baseUrl: runtime.baseUrl,
         model: this.session.model,
         messages: request,
+        effort: this.config.effort,
         signal: this.controller.signal,
         onReasoning: (delta) => {
           reasoning += delta;
@@ -751,6 +785,7 @@ export class DeepSeekTui {
         baseUrl: runtime.baseUrl,
         model: this.session.model,
         messages: request,
+        effort: this.config.effort,
         signal: this.controller.signal,
       });
       clearCurrentLine(this.output);
@@ -966,6 +1001,7 @@ export class DeepSeekTui {
         baseUrl: runtime.baseUrl,
         model: this.session.model,
         messages,
+        effort: this.config.effort,
         signal: this.controller.signal,
         onReasoning: (delta) => {
           reasoning += delta;
