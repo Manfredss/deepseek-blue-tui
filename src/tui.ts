@@ -28,7 +28,7 @@ import type { FileLock } from "./fs-utils.js";
 import { commandHelp, parseSlashCommand, renderSlashCommandMenu, slashCommandSuggestions, unescapePrompt } from "./commands.js";
 import { colorEnabled, createTheme, clearCurrentLine, type Theme } from "./theme.js";
 import { renderWelcomeScreen } from "./logo.js";
-import { LineInput, promptSecret, MenuPicker, type MenuPickerOptions, type MenuPickerResult } from "./input.js";
+import { LineInput, promptSecret, MenuPicker, watchAbortKeys, type MenuPickerOptions, type MenuPickerResult } from "./input.js";
 import { DeepSeekApiError, getBalance, streamChat } from "./api.js";
 import { DEEPSEEK_URLS, openUrl } from "./open-url.js";
 import { DshManager, formatDshStatus, installDsh } from "./dsh.js";
@@ -325,6 +325,24 @@ export class DeepSeekTui {
     } finally {
       this.input.resumeFromMenu();
     }
+  }
+
+  /**
+   * Takes exclusive control of the terminal while a generation is in flight:
+   * Esc and Ctrl+C abort the current request, arrow keys are ignored, and
+   * complete type-ahead lines are replayed as the next message after the
+   * generation settles.
+   */
+  private beginGenerationGuard(): { detach: () => void } {
+    this.input.suspendForMenu();
+    const watcher = watchAbortKeys(this.inputStream, () => this.controller?.abort());
+    return {
+      detach: () => {
+        const leftover = watcher.detach();
+        this.input.resumeFromMenu();
+        if (leftover) this.input.pushText(leftover);
+      },
+    };
   }
 
   private async chooseSession(sessions: Session[]): Promise<Session | undefined> {
@@ -699,7 +717,7 @@ export class DeepSeekTui {
     }
     const request: ChatMessage[] = [...this.session.messages, { role: "user", content: text, createdAt: new Date().toISOString() }];
     this.controller = new AbortController();
-    this.input.pause();
+    const generationGuard = this.beginGenerationGuard();
     this.write(`\n${this.theme.muted("◇ 侧问（单轮，不写入会话）")}\n`);
     let content = "";
     let reasoning = "";
@@ -737,8 +755,8 @@ export class DeepSeekTui {
       if ((error as Error).name === "AbortError") this.line(`\n${this.theme.yellow("已取消侧问。")}\n`);
       else this.line(`\n${this.theme.red(`侧问失败：${this.errorMessage(error)}`)}\n`);
     } finally {
+      generationGuard.detach();
       this.controller = undefined;
-      this.input.resume();
     }
   }
 
@@ -776,7 +794,7 @@ export class DeepSeekTui {
       { role: "user", content: COMPACT_INSTRUCTION, createdAt: new Date().toISOString() },
     ];
     this.controller = new AbortController();
-    this.input.pause();
+    const generationGuard = this.beginGenerationGuard();
     this.write(`\n${this.theme.muted("● 正在压缩历史…")}`);
     const startedAt = Date.now();
     try {
@@ -808,8 +826,8 @@ export class DeepSeekTui {
       if ((error as Error).name === "AbortError") this.line(`\n${this.theme.yellow("已取消压缩。")}\n`);
       else this.line(`\n${this.theme.red(`压缩失败：${this.errorMessage(error)}`)}\n`);
     } finally {
+      generationGuard.detach();
       this.controller = undefined;
-      this.input.resume();
     }
   }
 
@@ -988,7 +1006,7 @@ export class DeepSeekTui {
     }
 
     this.controller = new AbortController();
-    this.input.pause();
+    const generationGuard = this.beginGenerationGuard();
     this.write(`\n${this.theme.muted("● 正在思考…")}`);
     const startedAt = Date.now();
     let content = "";
@@ -1050,8 +1068,8 @@ export class DeepSeekTui {
       if ((error as Error).name === "AbortError") this.line(`\n${this.theme.yellow("已取消本次生成。")}\n`);
       else this.line(`\n${this.theme.red(`请求失败：${this.errorMessage(error)}`)}\n`);
     } finally {
+      generationGuard.detach();
       this.controller = undefined;
-      this.input.resume();
     }
   }
 

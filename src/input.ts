@@ -526,6 +526,18 @@ export class LineInput {
     }
   }
 
+  /**
+   * Queues complete lines typed while the prompt was suspended (e.g. during
+   * a generation). A trailing partial line without Enter is discarded, since
+   * it cannot be safely restored into the line editor.
+   */
+  pushText(text: string): void {
+    const segments = text.split(/\r\n|\r|\n/);
+    for (const line of segments.slice(0, -1)) {
+      if (line.length > 0) this.queued.push(line);
+    }
+  }
+
   close(): void {
     if (!this.closed) this.interface.close();
   }
@@ -734,6 +746,110 @@ export class MenuPicker {
       finish = resolve;
     });
   }
+}
+
+// ---------------------------------------------------------------------------
+// watchAbortKeys: raw-key watcher for interrupting in-flight generations.
+// Esc (lone) and Ctrl+C abort; arrow sequences are ignored; any other
+// keystrokes are buffered so completed type-ahead lines can be replayed.
+// ---------------------------------------------------------------------------
+
+export interface AbortKeyWatcher {
+  /** Removes the watcher and returns the buffered type-ahead text. */
+  detach: () => string;
+}
+
+export function watchAbortKeys(
+  input: NodeJS.ReadableStream,
+  onAbort: () => void,
+): AbortKeyWatcher {
+  const stream = input as NodeJS.ReadStream;
+  let typed = "";
+  let escapeBuffer = "";
+  let inCsi = false;
+  let escapeTimer: NodeJS.Timeout | undefined;
+  let aborted = false;
+  let detached = false;
+
+  const abort = (): void => {
+    if (aborted) return;
+    aborted = true;
+    onAbort();
+  };
+
+  const clearEscapeTimer = (): void => {
+    if (escapeTimer) clearTimeout(escapeTimer);
+    escapeTimer = undefined;
+  };
+
+  const onData = (chunk: Buffer): void => {
+    if (detached) return;
+    const text = chunk.toString("utf8");
+    for (const character of text) {
+      if (detached) return;
+      const codePoint = character.codePointAt(0) ?? 0;
+
+      if (inCsi) {
+        clearEscapeTimer();
+        if (codePoint >= CSI_FINAL_MIN && codePoint <= CSI_FINAL_MAX) {
+          // Arrow keys and friends: ignore, but do not abort.
+          escapeBuffer = "";
+          inCsi = false;
+        } else if (codePoint === 0x1b) {
+          escapeBuffer = "\u001b";
+          inCsi = false;
+        }
+        continue;
+      }
+      if (escapeBuffer === "\u001b") {
+        clearEscapeTimer();
+        if (character === "[") {
+          inCsi = true;
+          continue;
+        }
+        // Lone Escape means cancel the generation.
+        escapeBuffer = "";
+        abort();
+        return;
+      }
+      if (character === "\u001b") {
+        escapeBuffer = "\u001b";
+        escapeTimer = setTimeout(() => {
+          escapeTimer = undefined;
+          if (escapeBuffer === "\u001b") {
+            escapeBuffer = "";
+            abort();
+          }
+        }, ESCAPE_TIMEOUT_MS);
+        escapeTimer.unref();
+        continue;
+      }
+      if (codePoint === 0x03) {
+        abort();
+        continue;
+      }
+      typed += character;
+    }
+  };
+
+  if (!stream.isTTY) {
+    return { detach: () => "" };
+  }
+  stream.resume();
+  stream.setRawMode?.(true);
+  stream.on("data", onData);
+
+  return {
+    detach: () => {
+      if (detached) return "";
+      detached = true;
+      clearEscapeTimer();
+      stream.removeListener("data", onData);
+      stream.setRawMode?.(false);
+      stream.pause();
+      return typed;
+    },
+  };
 }
 
 export async function promptSecret(
