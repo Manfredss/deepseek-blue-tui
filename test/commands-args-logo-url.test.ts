@@ -5,6 +5,7 @@ import test from "node:test";
 
 import { cliHelp, parseCliArgs } from "../src/args.js";
 import {
+  closestCommands,
   commandHelp,
   completeSlashCommand,
   parseSlashCommand,
@@ -206,4 +207,23 @@ test("renderLogo renders a blue whale and styled product title", () => {
   assert.match(colored, /\u001b\[38;2;77;107;254m/);
   assert.match(colored, /\u001b\[1mDeepSeek\u001b\[22m/);
   assert.match(colored, /\u001b\[38;2;128;138;157mTerminal\u001b\[0m/);
+});
+
+test("closestCommands suggests prefixes first and tolerates small typos", () => {
+  assert.deepEqual(closestCommands("mod"), ["/model"]);
+  assert.deepEqual(closestCommands("moddel"), ["/model"]);
+  assert.deepEqual(closestCommands("statuss"), ["/status"]);
+  assert.deepEqual(closestCommands("e"), ["/effort", "/export", "/edit"], "prefix matches keep command order");
+  assert.deepEqual(closestCommands("zzzzzzzz"), [], "a wild miss suggests nothing");
+  assert.deepEqual(closestCommands("Users/wenfei/notes.md"), [], "a path is not a near-miss command");
+  assert.ok(closestCommands("co").length <= 3, "suggestions stay short");
+});
+
+test("commandHelp documents the keyboard shortcuts users are expected to know", () => {
+  const help = commandHelp();
+  for (const key of ["Ctrl+C", "Ctrl+D", "Ctrl+L", "Esc", "Enter"]) {
+    assert.ok(help.includes(key), `help should mention ${key}`);
+  }
+  assert.equal(help.includes("\u001b["), false, "plain help must not leak ANSI");
+  assert.ok(commandHelp(createTheme(true, { COLORTERM: "truecolor" })).includes("\u001b["));
 });

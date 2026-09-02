@@ -18,6 +18,7 @@ import {
   deriveTitle,
   estimateTokens,
   parseSession,
+  planRequest,
   truncateToLimit,
 } from "../src/session-store.js";
 import { DEFAULT_CONFIG, EMPTY_USAGE, type ChatMessage, type Session } from "../src/types.js";
@@ -322,4 +323,37 @@ test("truncateToLimit keeps system messages and the newest tail, dropping the ol
   assert.equal(oversized.messages.length, 2);
   assert.equal(oversized.messages[0]?.role, "system");
   assert.equal(oversized.messages.at(-1)?.content, "汉".repeat(100));
+});
+
+test("planRequest trims the request without touching stored history", () => {
+  const messages: ChatMessage[] = [
+    { role: "user", content: "汉".repeat(100), createdAt: "2026-01-01T00:00:01.000Z" },
+    { role: "assistant", content: "汉".repeat(100), createdAt: "2026-01-01T00:00:02.000Z" },
+    { role: "user", content: "最新的问题", createdAt: "2026-01-01T00:00:03.000Z" },
+  ];
+  const snapshot = [...messages];
+
+  const plan = planRequest(messages, 120);
+  assert.ok(plan.dropped > 0, "an over-limit history must be trimmed for the wire");
+  assert.ok(plan.messages.length < messages.length);
+  assert.equal(plan.messages.at(-1)?.content, "最新的问题");
+  assert.deepEqual(messages, snapshot, "the caller's history must not be mutated");
+  assert.notEqual(plan.messages, messages, "a trimmed plan must not alias the stored array");
+});
+
+test("planRequest passes short histories through and flags the 80% mark", () => {
+  const messages: ChatMessage[] = [
+    { role: "user", content: "汉".repeat(90), createdAt: "2026-01-01T00:00:01.000Z" },
+  ];
+  const estimated = estimateTokens(messages);
+
+  const roomy = planRequest(messages, estimated * 4);
+  assert.equal(roomy.dropped, 0);
+  assert.equal(roomy.nearLimit, false);
+  assert.equal(roomy.messages, messages, "an untrimmed plan should reuse the stored array");
+  assert.equal(roomy.estimated, estimated);
+
+  const tight = planRequest(messages, Math.ceil(estimated / 0.9));
+  assert.equal(tight.dropped, 0);
+  assert.equal(tight.nearLimit, true, "above 80% of the limit should warn without trimming");
 });

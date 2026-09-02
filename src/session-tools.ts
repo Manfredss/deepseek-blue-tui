@@ -2,7 +2,7 @@ import { spawnSync } from "node:child_process";
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
-import { createSession, estimateTokens } from "./session-store.js";
+import { createSession, estimateTextTokens, estimateTokens } from "./session-store.js";
 import type { ChatMessage, Session } from "./types.js";
 
 /**
@@ -55,15 +55,10 @@ export function buildContextBreakdown(
   for (const message of messages) {
     tokens.set(message.role, (tokens.get(message.role) ?? 0) + estimateTokens([message]));
   }
-  const reasoning = messages.reduce((sum, message) => {
-    if (!message.reasoningContent) return sum;
-    let count = 0;
-    for (const character of message.reasoningContent) {
-      const code = character.codePointAt(0) ?? 0;
-      count += code > 0x7f ? 1 : 0.25;
-    }
-    return sum + Math.ceil(count);
-  }, 0);
+  const reasoning = messages.reduce(
+    (sum, message) => sum + (message.reasoningContent ? Math.ceil(estimateTextTokens(message.reasoningContent)) : 0),
+    0,
+  );
   const roleTokens = [...tokens.values()].reduce((sum, value) => sum + value, 0);
   const total = Math.max(1, roleTokens + reasoning);
   const segments: ContextSegment[] = [];

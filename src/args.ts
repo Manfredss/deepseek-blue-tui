@@ -48,9 +48,15 @@ export function parseCliArgs(argv: string[]): CliOptions {
       break;
     }
     if (index === 0 && argument === "resume") {
-      options.resume = argv[1] ?? true;
-      if (argv.length > 2) prompt.push(...argv.slice(2));
-      break;
+      const candidate = argv[1];
+      if (candidate !== undefined && !candidate.startsWith("-")) {
+        options.resume = candidate;
+        if (argv.length > 2) prompt.push(...argv.slice(2));
+        break;
+      }
+      // `deepseek resume --thinking`: no session id, keep parsing the flags.
+      options.resume = true;
+      continue;
     }
     if (argument === "-h" || argument === "--help") options.help = true;
     else if (argument === "-V" || argument === "--version") options.version = true;
@@ -94,6 +100,7 @@ export function cliHelp(): string {
 用法：
   deepseek                            启动交互终端
   deepseek "解释这个项目"             单次提问
+  cat notes.md | deepseek             从标准输入读取问题
   deepseek --model deepseek-v4-pro    指定模型
   deepseek --effort max               思考强度 low/high/max
   deepseek --continue                 恢复当前目录最近会话

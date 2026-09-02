@@ -1,15 +1,17 @@
 import { userInfo } from "node:os";
 import { join } from "node:path";
-import type { AppConfig, ChatMessage, ReasoningEffort, Session } from "./types.js";
+import { appendFile, readFile, writeFile } from "node:fs/promises";
+import type { AppConfig, ChatMessage, ReasoningEffort, Session, TokenUsage } from "./types.js";
 import { REASONING_EFFORT_LABELS, REASONING_EFFORTS, RECOMMENDED_MODELS } from "./types.js";
 import { ConfigStore, maskApiKey } from "./config.js";
 import {
   addUsage,
   createSession,
   deriveTitle,
+  estimateTextTokens,
   estimateTokens,
+  planRequest,
   SessionStore,
-  truncateToLimit,
 } from "./session-store.js";
 import {
   applyCompactSummary,
@@ -25,15 +27,25 @@ import {
   writeSessionExport,
 } from "./session-tools.js";
 import type { FileLock } from "./fs-utils.js";
-import { commandHelp, parseSlashCommand, renderSlashCommandMenu, slashCommandSuggestions, unescapePrompt } from "./commands.js";
-import { colorEnabled, createTheme, clearCurrentLine, type Theme } from "./theme.js";
+import { ensurePrivateDirectory } from "./fs-utils.js";
+import {
+  closestCommands,
+  commandHelp,
+  parseSlashCommand,
+  renderSlashCommandMenu,
+  slashCommandSuggestions,
+  unescapePrompt,
+} from "./commands.js";
+import { colorEnabled, createTheme, type Theme } from "./theme.js";
 import { renderWelcomeScreen } from "./logo.js";
 import { LineInput, promptSecret, MenuPicker, watchAbortKeys, type MenuPickerOptions, type MenuPickerResult } from "./input.js";
 import { DeepSeekApiError, getBalance, streamChat } from "./api.js";
 import { DEEPSEEK_URLS, openUrl } from "./open-url.js";
 import { DshManager, formatDshStatus, installDsh } from "./dsh.js";
 import { LockHeldError } from "./fs-utils.js";
-import { renderContextHud, renderContextReport } from "./context-view.js";
+import { renderContextHud, renderContextReport, renderPressureBar } from "./context-view.js";
+import { Spinner } from "./spinner.js";
+import { clipToWidth, padToWidth } from "./text-width.js";
 import { VERSION } from "./version.js";
 
 export interface TuiOptions {
@@ -51,6 +63,10 @@ export interface TuiOptions {
   output?: NodeJS.WriteStream;
 }
 
+const HISTORY_LIMIT = 500;
+/** Window in which a second Ctrl+C at an empty prompt means "quit". */
+const INTERRUPT_EXIT_WINDOW_MS = 3_000;
+
 function safeTerminalText(value: string): string {
   return value.replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g, "");
 }
@@ -59,6 +75,15 @@ function shortText(value: string, width = 900): string {
   const clean = safeTerminalText(value).trim();
   if (clean.length <= width) return clean;
   return `${clean.slice(0, width - 1)}…`;
+}
+
+/**
+ * Single-line preview for table rows and menu items: newlines and runs of
+ * whitespace collapse to one space so a multi-line message cannot break the
+ * surrounding layout.
+ */
+function oneLine(value: string, width: number): string {
+  return shortText(safeTerminalText(value).replace(/\s+/gu, " "), width);
 }
 
 function validModel(value: string): boolean {
@@ -78,9 +103,9 @@ function formatTime(value: string): string {
 
 function currentUsername(): string {
   try {
-    return safeTerminalText(userInfo().username).trim().slice(0, 48) || "friend";
+    return safeTerminalText(userInfo().username).trim().slice(0, 48) || "朋友";
   } catch {
-    return "friend";
+    return "朋友";
   }
 }
 
@@ -101,6 +126,9 @@ export class DeepSeekTui {
   private exitRequested = false;
   private controller: AbortController | undefined;
   private lastInterrupt = 0;
+  private interruptArmedAt = 0;
+  private readonly historyPath: string;
+  private history: string[] = [];
   private processInterrupt: () => void;
   private sessionLock: FileLock | undefined;
   private readOnly = false;
@@ -120,6 +148,7 @@ export class DeepSeekTui {
     this.session = options.session;
     this.resumeQuery = options.resumeQuery;
     this.continueLast = options.continueLast ?? false;
+    this.historyPath = join(this.configStore.home, "history");
     this.processInterrupt = () => this.handleInterrupt();
   }
 
@@ -132,6 +161,12 @@ export class DeepSeekTui {
         values: slashCommandSuggestions(line).map(({ command }) => command),
       }),
       onResize: () => this.redrawHomeForResize(),
+      history: {
+        entries: this.history,
+        append: (entry) => this.appendHistory(entry),
+        // Recalling the command that just ended the session is never useful.
+        accepts: (entry) => !/^\/(?:exit|quit)\b/iu.test(entry),
+      },
     });
     input.onInterrupt = () => this.handleInterrupt();
     return input;
@@ -179,8 +214,16 @@ export class DeepSeekTui {
     const columns = this.terminalColumns();
     this.line(this.theme.muted("─".repeat(columns)));
     this.line(
-      `${this.theme.blue("●")} ${this.theme.bold(this.session.model)} ${this.theme.muted(columns < 40 ? "· /help" : "· /help 查看命令")}`,
+      clipToWidth(
+        `${this.theme.blue("●")} ${this.theme.bold(this.session.model)} ${this.theme.muted(`· 思考强度 ${this.config.effort}`)} ${this.theme.muted(columns < 40 ? "· /help" : "· /help 查看命令")}`,
+        columns,
+      ),
     );
+    if (columns >= 72) {
+      this.line(this.theme.muted("⏎ 发送 · \\ 换行 · / 命令 · Tab 补全 · ↑ 历史 · Esc 中断 · Ctrl+C 退出"));
+    } else if (columns >= 44) {
+      this.line(this.theme.muted("⏎ 发送 · / 命令 · Tab 补全 · Esc 中断"));
+    }
     if (!runtime.apiKey) {
       this.line(
         this.theme.yellow(
@@ -191,22 +234,85 @@ export class DeepSeekTui {
     this.line();
   }
 
+  /** Clears the viewport; `scrollback` also drops the terminal's history. */
+  private clearScreen(scrollback = false): void {
+    if (!this.output.isTTY) return;
+    this.write(scrollback ? "\u001b[2J\u001b[3J\u001b[H" : "\u001b[2J\u001b[H");
+  }
+
   private redrawHomeForResize(): void {
     if (!this.mainPromptActive || !this.homeScreenPristine || !this.session || this.controller) return;
-    this.write("\u001b[2J\u001b[H");
+    this.clearScreen();
     this.renderHome();
   }
 
+  /**
+   * Ctrl+C follows Claude Code: it aborts an in-flight generation, otherwise
+   * it clears the line editor, and only a second press against an already
+   * empty prompt exits. Ctrl+D (readline close) still exits immediately.
+   */
   private handleInterrupt(): void {
     const now = Date.now();
+    // Both readline and the process signal can deliver the same Ctrl+C.
     if (now - this.lastInterrupt < 80) return;
     this.lastInterrupt = now;
     if (this.controller) {
       this.controller.abort();
       return;
     }
+    if (!this.input?.isPrompting()) {
+      this.quit();
+      return;
+    }
+    if (this.input.currentLine().length > 0) {
+      this.input.resetLine();
+      this.interruptArmedAt = 0;
+      return;
+    }
+    if (now - this.interruptArmedAt <= INTERRUPT_EXIT_WINDOW_MS) {
+      this.quit();
+      return;
+    }
+    this.interruptArmedAt = now;
+    this.input.notice(this.theme.muted("再按一次 Ctrl+C 退出（或输入 /exit）"));
+  }
+
+  private quit(): void {
     this.exitRequested = true;
     this.input?.close();
+  }
+
+  private async loadHistory(): Promise<void> {
+    try {
+      const raw = await readFile(this.historyPath, "utf8");
+      const entries = raw.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+      this.history.splice(0, this.history.length, ...entries.slice(-HISTORY_LIMIT));
+    } catch {
+      // A missing or unreadable history file simply means no recall.
+    }
+  }
+
+  private appendHistory(entry: string): void {
+    void (async () => {
+      try {
+        await ensurePrivateDirectory(this.configStore.home);
+        await appendFile(this.historyPath, `${entry}\n`, { mode: 0o600 });
+      } catch {
+        // History is a convenience; never let it break the prompt.
+      }
+    })();
+  }
+
+  /** Keeps the on-disk history bounded, tolerating concurrent terminals. */
+  private async trimHistory(): Promise<void> {
+    try {
+      const raw = await readFile(this.historyPath, "utf8");
+      const entries = raw.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+      if (entries.length <= HISTORY_LIMIT) return;
+      await writeFile(this.historyPath, `${entries.slice(-HISTORY_LIMIT).join("\n")}\n`, { mode: 0o600 });
+    } catch {
+      // Ignore: trimming is best-effort housekeeping.
+    }
   }
 
   private async initialSession(): Promise<Session> {
@@ -263,6 +369,7 @@ export class DeepSeekTui {
     if (!(this.inputStream as NodeJS.ReadStream).isTTY || !this.output.isTTY) {
       throw new Error("交互模式需要 TTY；单次调用请使用 deepseek \"你的问题\"");
     }
+    await this.loadHistory();
     this.input = this.makeInput();
     process.on("SIGINT", this.processInterrupt);
 
@@ -274,15 +381,26 @@ export class DeepSeekTui {
 
       while (!this.exitRequested) {
         this.mainPromptActive = true;
-        const line = await this.input.next(this.theme.brightBlue("❯ "), { suggestions: true });
+        const line = await this.input.next(this.theme.brightBlue("❯ "), {
+          suggestions: true,
+          continuation: this.theme.muted("… "),
+        });
         this.mainPromptActive = false;
         if (line === undefined) break;
+        this.interruptArmedAt = 0;
         const trimmed = line.trim();
         if (!trimmed) continue;
         this.homeScreenPristine = false;
         const command = parseSlashCommand(line);
-        if (command) await this.handleCommand(command.name, command.args, command.tokens);
-        else await this.sendMessage(unescapePrompt(line));
+        try {
+          if (command) await this.handleCommand(command.name, command.args, command.tokens);
+          else await this.sendMessage(unescapePrompt(line));
+        } catch (error) {
+          // A failing command (unreadable file, full disk, offline DSH) must
+          // never take the whole REPL down with it.
+          if ((error as Error).name === "AbortError") this.line(this.theme.yellow("已取消。"));
+          else this.line(this.theme.red(`出错了：${this.errorMessage(error)}`));
+        }
       }
     } finally {
       this.mainPromptActive = false;
@@ -290,6 +408,7 @@ export class DeepSeekTui {
         await this.sessionStore.save(this.session);
       }
       await this.sessionLock?.release();
+      await this.trimHistory();
       this.input?.close();
       process.removeListener("SIGINT", this.processInterrupt);
       if (this.output.isTTY) this.line(this.theme.muted("再见。"));
@@ -303,9 +422,15 @@ export class DeepSeekTui {
       this.line(this.theme.muted(`… 已省略更早的 ${session.messages.length - messages.length} 条消息`));
     }
     for (const message of messages) {
-      const label = message.role === "user" ? this.theme.brightBlue("You") : this.theme.blue("DeepSeek");
-      if (message.role === "system") continue;
-      this.line(`\n${label}`);
+      if (message.role === "system") {
+        this.line(`\n${this.theme.muted(`◇ 摘要  ${oneLine(message.content, 160)}`)}`);
+        continue;
+      }
+      if (message.role === "user") {
+        this.line(`\n${this.theme.brightBlue("❯")} ${shortText(message.content, 400)}`);
+        continue;
+      }
+      this.line(`\n${this.theme.blue("◆ DeepSeek")}`);
       if (message.reasoningContent && this.config.showReasoning) {
         this.line(this.theme.muted(shortText(message.reasoningContent, 500)));
       }
@@ -355,7 +480,7 @@ export class DeepSeekTui {
       title: "最近会话",
       items: visible.map(
         (session, index) =>
-          `${String(index + 1).padStart(2)}  ${formatTime(session.updatedAt)}  ${shortText(session.title, 48)}`,
+          `${String(index + 1).padStart(2)}  ${formatTime(session.updatedAt)}  ${oneLine(session.title, 200)}`,
       ),
       footer: "↑/↓ 选择 · Enter 确认 · Esc 取消 · 数字跳转",
     });
@@ -366,7 +491,7 @@ export class DeepSeekTui {
   private async handleCommand(name: string, args: string, tokens: string[]): Promise<void> {
     switch (name) {
       case "help":
-        this.line(commandHelp());
+        this.line(commandHelp(this.theme));
         break;
       case "exit":
       case "quit":
@@ -433,12 +558,26 @@ export class DeepSeekTui {
         await this.handleDsh(tokens);
         break;
       default:
-        this.line(this.theme.yellow(`未知命令：/${name}。输入 /help 查看可用命令。`));
+        this.reportUnknownCommand(name);
     }
   }
 
+  private reportUnknownCommand(name: string): void {
+    this.line(this.theme.yellow(`未知命令：/${name}`));
+    const near = closestCommands(name);
+    if (near.length > 0) {
+      this.line(this.theme.muted(`你是不是想输入：${near.join(" · ")}`));
+      return;
+    }
+    if (name.includes("/") || name.includes("\\")) {
+      this.line(this.theme.muted(`要把以 / 开头的路径当作普通消息发送，请改用 //${name}`));
+      return;
+    }
+    this.line(this.theme.muted("输入 /help 查看全部命令。"));
+  }
+
   private async changeModel(requested: string): Promise<void> {
-    let model = requested.trim();
+    let model = requested.trim().split(/\s+/u)[0] ?? "";
     if (!model) {
       const result = await this.runMenu({
         title: "选择模型",
@@ -538,6 +677,9 @@ export class DeepSeekTui {
     if (this.session.messages.length > 0) await this.saveSession();
     this.session = createSession(this.cwd, this.session.model);
     await this.lockSession(this.session);
+    this.clearScreen(true);
+    this.renderHome();
+    this.homeScreenPristine = !this.readOnly;
     this.line(`${this.theme.green("✓")} 已开始新会话；原会话仍可通过 /resume 恢复。`);
   }
 
@@ -567,8 +709,12 @@ export class DeepSeekTui {
       return;
     }
     this.session.title = clean.slice(0, 100);
-    await this.sessionStore.save(this.session);
-    this.line(`${this.theme.green("✓")} 会话已重命名为 ${this.session.title}`);
+    await this.saveSession();
+    this.line(
+      this.readOnly
+        ? `${this.theme.yellow("!")} 会话为只读，标题只在本次运行内生效：${this.session.title}`
+        : `${this.theme.green("✓")} 会话已重命名为 ${this.session.title}`,
+    );
   }
 
   private async toggleThinking(value: string | undefined): Promise<void> {
@@ -607,59 +753,76 @@ export class DeepSeekTui {
     if (!effort) return;
     this.config.effort = effort;
     await this.configStore.save(this.config);
-    this.line(`${this.theme.green("✓")} 思考强度已设为 ${this.theme.bold(effort)}（${REASONING_EFFORT_LABELS[effort]}）`);
+    this.line(
+      `${this.theme.green("✓")} 思考强度已设为 ${this.theme.bold(effort)} ${this.theme.muted(`· ${REASONING_EFFORT_LABELS[effort]}`)}`,
+    );
   }
 
+  /** /status — one aligned panel: model, session, credentials, DSH. */
   private async showStatus(): Promise<void> {
     if (!this.session) return;
     const runtime = this.configStore.runtime(this.config);
     const dshStatus = await this.dsh.status(this.config.dshPort);
-    this.line(
-      renderContextHud(
-        this.theme,
-        {
-          model: this.session.model,
-          estimatedTokens: estimateTokens(this.session.messages),
-          limitTokens: this.config.contextLimitTokens,
-          messageCount: this.session.messages.length,
-          showReasoning: this.config.showReasoning,
-          readOnly: this.readOnly,
-          apiKeyConfigured: Boolean(runtime.apiKey),
-          usage: this.session.usage,
-          cwd: this.cwd,
-        },
-        { columns: this.terminalColumns() },
-      ),
+    const estimated = estimateTokens(this.session.messages);
+    const limit = this.config.contextLimitTokens;
+    const percent = Number.isFinite(limit) && limit > 0 ? Math.min(100, (estimated / limit) * 100) : undefined;
+    const usage = this.session.usage;
+    const cacheTotal = usage.promptCacheHitTokens + usage.promptCacheMissTokens;
+    const cacheNote =
+      cacheTotal > 0
+        ? `· 缓存命中 ${usage.promptCacheHitTokens.toLocaleString()} (${((usage.promptCacheHitTokens / cacheTotal) * 100).toFixed(1)}%)`
+        : "· 暂无缓存数据";
+    const contextPercent = percent === undefined ? "≈–%" : `≈${String(Math.round(percent))}%`;
+    const fromEnvironment = Boolean(process.env.DEEPSEEK_API_KEY?.trim());
+    const rows: readonly (readonly [string, string])[] = [
+      ["模型", `${this.theme.bold(this.session.model)} ${this.theme.muted(`· ${runtime.baseUrl}`)}`],
+      [
+        "思考",
+        `${this.theme.bold(this.config.effort)} ${this.theme.muted(`· ${REASONING_EFFORT_LABELS[this.config.effort]} · 过程${this.config.showReasoning ? "显示" : "隐藏"}`)}`,
+      ],
+      [
+        "上下文",
+        `${contextPercent} ${renderPressureBar(this.theme, percent)} ${formatCompactTokens(estimated)}/${formatCompactTokens(limit)} ${this.theme.muted(`· ${this.session.messages.length} 条消息`)}`,
+      ],
+      [
+        "累计",
+        `${usage.totalTokens.toLocaleString()} tokens ${this.theme.muted(cacheNote)}`,
+      ],
+      ["速度", this.renderTpsLine()],
+      [
+        "会话",
+        `${this.session.id.slice(0, 8)} ${this.theme.muted(`· ${oneLine(this.session.title, 200)}`)}${this.readOnly ? this.theme.yellow(" · 只读") : ""}`,
+      ],
+      ["凭据", `${maskApiKey(runtime.apiKey)}${fromEnvironment ? this.theme.muted(" · 来自环境变量") : ""}`],
+      ["目录", this.cwd],
+      ["DSH", formatDshStatus(dshStatus)],
+    ];
+    const columns = this.terminalColumns();
+    this.line(this.theme.bold("状态"));
+    for (const [label, value] of rows) {
+      this.line(clipToWidth(`  ${this.theme.muted(padToWidth(label, 6))}  ${value}`, columns));
+    }
+  }
+
+  /** Compact one-line context HUD (model · pressure · access · reasoning · API). */
+  private renderHud(): string {
+    if (!this.session) return "";
+    const runtime = this.configStore.runtime(this.config);
+    return renderContextHud(
+      this.theme,
+      {
+        model: this.session.model,
+        estimatedTokens: estimateTokens(this.session.messages),
+        limitTokens: this.config.contextLimitTokens,
+        messageCount: this.session.messages.length,
+        showReasoning: this.config.showReasoning,
+        readOnly: this.readOnly,
+        apiKeyConfigured: Boolean(runtime.apiKey),
+        usage: this.session.usage,
+        cwd: this.cwd,
+      },
+      { columns: this.terminalColumns() },
     );
-    this.line(
-      renderContextReport(
-        this.theme,
-        {
-          model: this.session.model,
-          estimatedTokens: estimateTokens(this.session.messages),
-          limitTokens: this.config.contextLimitTokens,
-          messageCount: this.session.messages.length,
-          showReasoning: this.config.showReasoning,
-          readOnly: this.readOnly,
-          apiKeyConfigured: Boolean(runtime.apiKey),
-          usage: this.session.usage,
-          cwd: this.cwd,
-        },
-        { columns: this.terminalColumns() },
-      ),
-    );
-    this.line(`${this.theme.bold("会话")}      ${this.session.id} · ${this.session.title}`);
-    this.line(`${this.theme.bold("Endpoint")}  ${runtime.baseUrl}`);
-    this.line(`${this.theme.bold("凭据")}      ${maskApiKey(runtime.apiKey)}${process.env.DEEPSEEK_API_KEY ? " (环境变量)" : ""}`);
-    this.line(
-      `${this.theme.bold("思考强度")}  ${this.theme.bold(this.config.effort)}${this.theme.muted(`（${REASONING_EFFORT_LABELS[this.config.effort]}）· 思考过程 ${this.config.showReasoning ? "显示" : "隐藏"}`)}`,
-    );
-    const hit = this.session.usage.promptCacheHitTokens;
-    const miss = this.session.usage.promptCacheMissTokens;
-    const hitRate = hit + miss > 0 ? ((hit / (hit + miss)) * 100).toFixed(1) : "—";
-    this.line(`${this.theme.bold("缓存命中")}  ${this.session.usage.promptCacheHitTokens.toLocaleString()} (${hitRate}%)`);
-    this.line(`${this.theme.bold("速度")}      ${this.renderTpsLine()}`);
-    this.line(`${this.theme.bold("DSH")}       ${formatDshStatus(dshStatus)}`);
   }
 
   private renderTpsLine(): string {
@@ -679,7 +842,27 @@ export class DeepSeekTui {
   private async showContext(): Promise<void> {
     if (!this.session) return;
     const messages = this.session.messages;
-    this.line(this.theme.bold(`上下文明细（估算，共 ${messages.length} 条）`));
+    const runtime = this.configStore.runtime(this.config);
+    this.line(
+      renderContextReport(
+        this.theme,
+        {
+          model: this.session.model,
+          estimatedTokens: estimateTokens(messages),
+          limitTokens: this.config.contextLimitTokens,
+          messageCount: messages.length,
+          showReasoning: this.config.showReasoning,
+          readOnly: this.readOnly,
+          apiKeyConfigured: Boolean(runtime.apiKey),
+          usage: this.session.usage,
+          cwd: this.cwd,
+        },
+        { columns: this.terminalColumns() },
+      ),
+    );
+    if (messages.length === 0) return;
+    this.line();
+    this.line(this.theme.bold(`逐条明细（估算，共 ${messages.length} 条）`));
     const head = messages.length > 50 ? messages.slice(-50) : messages;
     if (messages.length > head.length) this.line(this.theme.muted(`… 已省略更早的 ${messages.length - head.length} 条`));
     const labels: Record<ChatMessage["role"], string> = { system: "系统", user: "用户", assistant: "助手" };
@@ -687,7 +870,10 @@ export class DeepSeekTui {
       const offset = messages.length - head.length + index + 1;
       const tokens = formatCompactTokens(estimateTokens([message]));
       this.line(
-        `  ${this.theme.blue(String(offset).padStart(3))}  ${this.theme.muted(labels[message.role].padEnd(2))} ${this.theme.muted(tokens.padStart(6))}  ${shortText(message.content, 60)}`,
+        clipToWidth(
+          `  ${this.theme.blue(String(offset).padStart(3))}  ${this.theme.muted(labels[message.role])} ${this.theme.muted(tokens.padStart(6))}  ${oneLine(message.content, 200)}`,
+          this.terminalColumns(),
+        ),
       );
     });
     const breakdown = buildContextBreakdown(messages, this.config.contextLimitTokens, 30);
@@ -715,7 +901,10 @@ export class DeepSeekTui {
       this.line(this.theme.yellow("缺少 API Key。请先输入 /login，或设置 DEEPSEEK_API_KEY。"));
       return;
     }
-    const request: ChatMessage[] = [...this.session.messages, { role: "user", content: text, createdAt: new Date().toISOString() }];
+    const request = this.requestMessages([
+      ...this.session.messages,
+      { role: "user", content: text, createdAt: new Date().toISOString() },
+    ]);
     this.controller = new AbortController();
     const generationGuard = this.beginGenerationGuard();
     this.write(`\n${this.theme.muted("◇ 侧问（单轮，不写入会话）")}\n`);
@@ -723,6 +912,10 @@ export class DeepSeekTui {
     let reasoning = "";
     let reasoningShown = false;
     let contentShown = false;
+    const spinner = new Spinner(this.output, (frame, elapsedMs) =>
+      this.generationStatus(frame, elapsedMs, reasoning, "侧问中"),
+    );
+    spinner.start();
     try {
       const result = await streamChat({
         apiKey: runtime.apiKey,
@@ -733,28 +926,37 @@ export class DeepSeekTui {
         signal: this.controller.signal,
         onReasoning: (delta) => {
           reasoning += delta;
-          if (!this.config.showReasoning) return;
+          if (!this.config.showReasoning) {
+            spinner.refresh();
+            return;
+          }
           if (!reasoningShown) {
-            this.write(`${this.theme.muted(safeTerminalText(delta))}`);
+            spinner.stop();
             reasoningShown = true;
-          } else this.write(this.theme.muted(safeTerminalText(delta)));
+          }
+          this.write(this.theme.muted(safeTerminalText(delta)));
         },
         onContent: (delta) => {
           content += delta;
           if (!contentShown) {
+            spinner.stop();
             if (reasoningShown) this.write("\n");
             contentShown = true;
           }
           this.write(safeTerminalText(delta));
         },
       });
+      spinner.stop();
       if (!contentShown && !reasoningShown) this.write(this.theme.muted("(没有文本响应)"));
-      this.write(`\n\n${this.theme.muted(`侧问结束 · ${result.usage.totalTokens.toLocaleString()} tokens（不计入会话）`)}\n\n`);
+      this.write(
+        `\n\n${this.theme.muted(`侧问结束 · ${result.usage.totalTokens.toLocaleString()} tokens（不计入会话）`)}\n\n`,
+      );
     } catch (error) {
-      clearCurrentLine(this.output);
-      if ((error as Error).name === "AbortError") this.line(`\n${this.theme.yellow("已取消侧问。")}\n`);
+      spinner.stop();
+      if ((error as Error).name === "AbortError") this.line(`\n${this.theme.yellow("已中断侧问。")}\n`);
       else this.line(`\n${this.theme.red(`侧问失败：${this.errorMessage(error)}`)}\n`);
     } finally {
+      spinner.stop();
       generationGuard.detach();
       this.controller = undefined;
     }
@@ -777,7 +979,9 @@ export class DeepSeekTui {
       this.line(this.theme.yellow("缺少 API Key。请先输入 /login，或设置 DEEPSEEK_API_KEY。"));
       return;
     }
-    const answer = await this.input.next(this.theme.brightBlue("确认压缩？压缩前会自动导出备份 [y/N] › "));
+    const answer = await this.input.next(this.theme.brightBlue("确认压缩？压缩前会自动导出备份 [y/N] › "), {
+      history: false,
+    });
     if (answer?.trim().toLocaleLowerCase() !== "y") {
       this.line(this.theme.muted("已取消。"));
       return;
@@ -795,7 +999,11 @@ export class DeepSeekTui {
     ];
     this.controller = new AbortController();
     const generationGuard = this.beginGenerationGuard();
-    this.write(`\n${this.theme.muted("● 正在压缩历史…")}`);
+    const spinner = new Spinner(this.output, (frame, elapsedMs) =>
+      this.generationStatus(frame, elapsedMs, "", "正在压缩历史"),
+    );
+    this.write("\n");
+    spinner.start();
     const startedAt = Date.now();
     try {
       const result = await streamChat({
@@ -806,7 +1014,7 @@ export class DeepSeekTui {
         effort: this.config.effort,
         signal: this.controller.signal,
       });
-      clearCurrentLine(this.output);
+      spinner.stop();
       if (!result.content.trim()) {
         this.line(this.theme.yellow("模型未返回摘要，已保持会话不变。"));
         return;
@@ -818,14 +1026,17 @@ export class DeepSeekTui {
       await this.saveSession();
       const after = estimateTokens(this.session.messages);
       this.line(
-        `${this.theme.green("✓")} 已压缩为 1 条摘要消息（${formatCompactTokens(after)} tokens）。${this.theme.muted("原历史已备份到 exports 目录，可用 /resume 恢复此前会话时参考。")}`,
+        `${this.theme.green("✓")} 已压缩为 1 条摘要消息：${formatCompactTokens(estimated)} → ${formatCompactTokens(after)} tokens`,
       );
+      this.line(this.theme.muted("原历史已备份到 exports 目录，可用 /resume 参考此前会话。"));
+      this.line(this.renderHud());
       this.line();
     } catch (error) {
-      clearCurrentLine(this.output);
-      if ((error as Error).name === "AbortError") this.line(`\n${this.theme.yellow("已取消压缩。")}\n`);
+      spinner.stop();
+      if ((error as Error).name === "AbortError") this.line(`\n${this.theme.yellow("已中断压缩。")}\n`);
       else this.line(`\n${this.theme.red(`压缩失败：${this.errorMessage(error)}`)}\n`);
     } finally {
+      spinner.stop();
       generationGuard.detach();
       this.controller = undefined;
     }
@@ -887,7 +1098,7 @@ export class DeepSeekTui {
         title: "选择回退点（分支会话，原会话保留）",
         items: windowIndexes.map((index, position) => {
           const message = this.session?.messages[index];
-          return `${String(position + 1).padStart(2)}  ${shortText(message?.content ?? "", 56)}`;
+          return `${String(position + 1).padStart(2)}  ${oneLine(message?.content ?? "", 200)}`;
         }),
         footer: "↑/↓ 选择 · Enter 确认 · Esc 取消 · 数字跳转",
       });
@@ -923,9 +1134,15 @@ export class DeepSeekTui {
   }
 
   private async handleDsh(tokens: string[]): Promise<void> {
-    const action = tokens[0]?.toLocaleLowerCase() ?? "open";
-    const portToken = tokens.find((token, index) => index > 0 && /^\d+$/.test(token));
+    const first = tokens[0]?.toLocaleLowerCase();
+    // `/dsh 3081` is a port, not an action.
+    const action = first === undefined || /^\d+$/.test(first) ? "open" : first;
+    const portToken = tokens.find((token) => /^\d+$/.test(token));
     const port = portToken ? Number.parseInt(portToken, 10) : this.config.dshPort;
+    if (!Number.isInteger(port) || port <= 0 || port > 65_535) {
+      this.line(this.theme.yellow("端口必须在 1 到 65535 之间。"));
+      return;
+    }
     try {
       if (action === "install") {
         const result = await installDsh();
@@ -971,6 +1188,53 @@ export class DeepSeekTui {
     this.line(opened ? `${this.theme.green("✓")} 已打开${label}` : `${label}：${url}`);
   }
 
+  /**
+   * Builds the message list for one request. History that no longer fits is
+   * omitted from the request only — the stored session keeps every message so
+   * /export, /rewind and /search still see the full conversation.
+   */
+  private requestMessages(messages: ChatMessage[]): ChatMessage[] {
+    const limit = this.config.contextLimitTokens;
+    const plan = planRequest(messages, limit);
+    if (plan.dropped > 0) {
+      this.line(
+        this.theme.yellow(
+          `上下文超限（估算 ${plan.estimated.toLocaleString()} > ${limit.toLocaleString()} tokens），本次请求省略最早的 ${plan.dropped} 条消息。`,
+        ),
+      );
+      this.line(this.theme.muted("本地历史仍然完整；可用 /compact 压缩，或在 config.json 调高 contextLimitTokens。"));
+    } else if (plan.nearLimit) {
+      this.line(
+        this.theme.yellow(
+          `上下文较长（估算 ${plan.estimated.toLocaleString()} tokens，上限 ${limit.toLocaleString()}）。可用 /compact 压缩历史。`,
+        ),
+      );
+    }
+    return plan.messages;
+  }
+
+  /** Live status line shown while a request is in flight. */
+  private generationStatus(frame: string, elapsedMs: number, reasoning: string, label: string): string {
+    const parts = [`${String(Math.max(0, Math.round(elapsedMs / 1_000)))}s`];
+    if (reasoning.length > 0) parts.push(`思考 ${formatCompactTokens(estimateTextTokens(reasoning))} tokens`);
+    parts.push("esc 中断");
+    return clipToWidth(
+      `${this.theme.blue(frame)} ${this.theme.muted(`${label}… (${parts.join(" · ")})`)}`,
+      this.terminalColumns(),
+    );
+  }
+
+  /** Per-turn accounting line printed under a completed response. */
+  private turnFooter(usage: TokenUsage, elapsedMs: number): string {
+    const seconds = Math.max(0.1, elapsedMs / 1_000);
+    const parts = [`${usage.promptTokens.toLocaleString()} in`, `${usage.completionTokens.toLocaleString()} out`];
+    if (usage.reasoningTokens > 0) parts.push(`${usage.reasoningTokens.toLocaleString()} thinking`);
+    if (usage.promptCacheHitTokens > 0) parts.push(`缓存 ${formatCompactTokens(usage.promptCacheHitTokens)}`);
+    parts.push(`${seconds.toFixed(1)}s`);
+    if (usage.completionTokens > 0) parts.push(`${(usage.completionTokens / seconds).toFixed(1)} tok/s`);
+    return parts.join(" · ");
+  }
+
   private async sendMessage(text: string): Promise<void> {
     if (!this.session) return;
     const runtime = this.configStore.runtime(this.config);
@@ -987,32 +1251,19 @@ export class DeepSeekTui {
     if (this.session.title === "New conversation") this.session.title = deriveTitle(text);
     await this.saveSession();
 
-    const limit = this.config.contextLimitTokens;
-    const estimated = estimateTokens(this.session.messages);
-    let messages = this.session.messages;
-    if (estimated > limit) {
-      const result = truncateToLimit(this.session.messages, limit);
-      this.session.messages = result.messages;
-      messages = result.messages;
-      this.line(
-        this.theme.yellow(
-          `上下文超限（估算 ${estimated.toLocaleString()} tokens > ${limit.toLocaleString()}），已裁剪最早的 ${result.dropped} 条消息。可在 config.json 调整 contextLimitTokens。`,
-        ),
-      );
-    } else if (estimated > limit * 0.8) {
-      this.line(
-        this.theme.yellow(`上下文较长（估算 ${estimated.toLocaleString()} tokens，上限 ${limit.toLocaleString()}）。`),
-      );
-    }
-
+    const messages = this.requestMessages(this.session.messages);
     this.controller = new AbortController();
     const generationGuard = this.beginGenerationGuard();
-    this.write(`\n${this.theme.muted("● 正在思考…")}`);
     const startedAt = Date.now();
     let content = "";
     let reasoning = "";
     let reasoningShown = false;
     let contentShown = false;
+    const spinner = new Spinner(this.output, (frame, elapsedMs) =>
+      this.generationStatus(frame, elapsedMs, reasoning, "正在思考"),
+    );
+    this.write("\n");
+    spinner.start();
     try {
       const result = await streamChat({
         apiKey: runtime.apiKey,
@@ -1023,26 +1274,30 @@ export class DeepSeekTui {
         signal: this.controller.signal,
         onReasoning: (delta) => {
           reasoning += delta;
-          if (!this.config.showReasoning) return;
+          if (!this.config.showReasoning) {
+            // Thinking stays hidden, but its size keeps the spinner honest.
+            spinner.refresh();
+            return;
+          }
           if (!reasoningShown) {
-            clearCurrentLine(this.output);
-            this.write(`${this.theme.muted("╭─ thinking")}\n${this.theme.muted(safeTerminalText(delta))}`);
+            spinner.stop();
+            this.write(`${this.theme.muted("╭─ 思考过程")}\n${this.theme.muted(safeTerminalText(delta))}`);
             reasoningShown = true;
           } else this.write(this.theme.muted(safeTerminalText(delta)));
         },
         onContent: (delta) => {
           content += delta;
           if (!contentShown) {
+            spinner.stop();
             if (reasoningShown) this.write(`\n${this.theme.muted("╰─")}\n\n`);
-            else clearCurrentLine(this.output);
             this.write(`${this.theme.blue("◆ DeepSeek")}\n`);
             contentShown = true;
           }
           this.write(safeTerminalText(delta));
         },
       });
+      spinner.stop();
       if (!contentShown) {
-        clearCurrentLine(this.output);
         this.write(`${this.theme.blue("◆ DeepSeek")}\n${this.theme.muted("(没有文本响应)")}`);
       }
       const assistant: ChatMessage = {
@@ -1056,18 +1311,21 @@ export class DeepSeekTui {
       this.session.lastTurnMs = Math.max(1, Date.now() - startedAt);
       this.session.lastCompletionTokens = result.usage.completionTokens;
       await this.saveSession();
-      this.write(`\n\n${this.theme.muted(`${result.usage.promptTokens.toLocaleString()} input · ${result.usage.completionTokens.toLocaleString()} output`)}\n\n`);
+      this.write(`\n\n${this.theme.muted(this.turnFooter(result.usage, Date.now() - startedAt))}\n\n`);
     } catch (error) {
-      if (content || reasoning) {
+      spinner.stop();
+      // Keep a partial answer, but never store an assistant turn with empty
+      // content: the API rejects it on the next request.
+      if (content.trim()) {
         const partial: ChatMessage = { role: "assistant", content, createdAt: new Date().toISOString() };
         if (reasoning) partial.reasoningContent = reasoning;
         this.session.messages.push(partial);
         await this.saveSession();
       }
-      clearCurrentLine(this.output);
-      if ((error as Error).name === "AbortError") this.line(`\n${this.theme.yellow("已取消本次生成。")}\n`);
+      if ((error as Error).name === "AbortError") this.line(`\n${this.theme.yellow("已中断本次生成。")}\n`);
       else this.line(`\n${this.theme.red(`请求失败：${this.errorMessage(error)}`)}\n`);
     } finally {
+      spinner.stop();
       generationGuard.detach();
       this.controller = undefined;
     }

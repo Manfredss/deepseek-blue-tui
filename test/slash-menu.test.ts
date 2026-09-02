@@ -460,3 +460,71 @@ test("resize keeps an Escape-dismissed menu closed until the line changes", asyn
   input.write("\r");
   assert.equal(await answer, "/m");
 });
+
+test("Tab completes a unique slash command without submitting it", async (t) => {
+  const { input, lineInput, rendered } = createSelectableLiveInput(t);
+  const answer = lineInput.next("❯ ", { suggestions: true });
+
+  input.write("/mo");
+  await eventually(() => lineInput.currentLine() === "/mo", "the line should hold the typed prefix");
+  const beforeTab = rendered().length;
+  input.write("\t");
+  await eventually(() => lineInput.currentLine() === "/model", "Tab should fill in the only match");
+  assert.equal(
+    rendered().slice(beforeTab).includes("\t"),
+    false,
+    "a literal tab must never reach the terminal",
+  );
+
+  let submitted = false;
+  void answer.then(() => {
+    submitted = true;
+  });
+  await settle();
+  assert.equal(submitted, false, "Tab completes without submitting");
+
+  input.write(" deepseek-v4-pro\r");
+  assert.equal(await answer, "/model deepseek-v4-pro", "arguments can be typed after completing");
+});
+
+test("Tab on an ambiguous prefix highlights the first candidate before taking it", async (t) => {
+  const { input, lineInput } = createSelectableLiveInput(t);
+  const answer = lineInput.next("❯ ", { suggestions: true });
+
+  input.write("/c");
+  await eventually(() => lineInput.currentLine() === "/c", "the line should hold the typed prefix");
+  input.write("\t");
+  await settle();
+  assert.equal(lineInput.currentLine(), "/c", "an unextendable prefix must not jump to one command");
+
+  input.write("\t");
+  await eventually(() => lineInput.currentLine() === "/clear", "a second Tab takes the highlighted candidate");
+
+  input.write("\r");
+  assert.equal(await answer, "/clear");
+});
+
+test("Tab takes an arrow-key selection and leaves prose alone", async (t) => {
+  const { input, lineInput } = createSelectableLiveInput(t);
+  const answer = lineInput.next("❯ ", { suggestions: true });
+
+  input.write("/c");
+  await eventually(() => lineInput.currentLine() === "/c", "the line should hold the typed prefix");
+  input.write("\u001b[B");
+  await settle();
+  input.write("\u001b[B");
+  await settle();
+  input.write("\t");
+  await eventually(() => lineInput.currentLine() === "/context", "Tab should take the highlighted command");
+  input.write("\r");
+  assert.equal(await answer, "/context");
+
+  const second = lineInput.next("❯ ", { suggestions: true });
+  input.write("hello");
+  await eventually(() => lineInput.currentLine().startsWith("hello"), "prose should be typed as-is");
+  input.write("\t");
+  await settle();
+  assert.match(lineInput.currentLine(), /^hello/u, "prose is never rewritten into a command");
+  input.write("\r");
+  await second;
+});

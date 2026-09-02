@@ -97,11 +97,12 @@ export function addUsage(total: TokenUsage, increment: TokenUsage): TokenUsage {
   };
 }
 
-function textTokens(value: string): number {
+/** Rough token estimate for a raw string: CJK ≈ 1 token/char, ASCII ≈ 4 chars/token. */
+export function estimateTextTokens(value: string): number {
   let count = 0;
   for (const character of value) {
     const code = character.codePointAt(0) ?? 0;
-    count += code > 0x7f ? 1 : 0.25; // CJK ≈ 1 token/char, ASCII ≈ 4 chars/token
+    count += code > 0x7f ? 1 : 0.25;
   }
   return count;
 }
@@ -109,8 +110,8 @@ function textTokens(value: string): number {
 export function estimateTokens(messages: ChatMessage[]): number {
   let tokens = messages.length * 4; // Per-message protocol overhead.
   for (const message of messages) {
-    tokens += textTokens(message.content);
-    if (message.reasoningContent) tokens += textTokens(message.reasoningContent);
+    tokens += estimateTextTokens(message.content);
+    if (message.reasoningContent) tokens += estimateTextTokens(message.reasoningContent);
   }
   return Math.ceil(tokens);
 }
@@ -139,6 +140,31 @@ export function truncateToLimit(messages: ChatMessage[], limitTokens: number): T
     tokens += cost;
   }
   return { messages: [...system, ...kept], dropped: rest.length - kept.length };
+}
+
+export interface RequestPlan {
+  /** Messages to put on the wire. */
+  messages: ChatMessage[];
+  /** Stored messages left out of this request (0 when everything fits). */
+  dropped: number;
+  /** Estimated token count of the *stored* history. */
+  estimated: number;
+  /** Above 80% of the limit but still fitting — worth warning about. */
+  nearLimit: boolean;
+}
+
+/**
+ * Plans one API request without touching stored history. An over-long
+ * conversation is trimmed for the wire only, so the session file keeps every
+ * message and /export, /rewind and /search still see the whole conversation.
+ */
+export function planRequest(messages: ChatMessage[], limitTokens: number): RequestPlan {
+  const estimated = estimateTokens(messages);
+  if (estimated > limitTokens) {
+    const result = truncateToLimit(messages, limitTokens);
+    return { messages: result.messages, dropped: result.dropped, estimated, nearLimit: false };
+  }
+  return { messages, dropped: 0, estimated, nearLimit: estimated > limitTokens * 0.8 };
 }
 
 export class SessionStore {

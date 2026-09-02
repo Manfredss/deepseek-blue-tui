@@ -10,8 +10,7 @@ import {
   addUsage,
   createSession,
   deriveTitle,
-  estimateTokens,
-  truncateToLimit,
+  planRequest,
 } from "./session-store.js";
 import { DshManager, formatDshStatus, installDsh } from "./dsh.js";
 import { DeepSeekTui } from "./tui.js";
@@ -138,24 +137,33 @@ export async function runOneShot(options: {
   }
 }
 
+/**
+ * Message list for one request. Over-limit history is dropped from the request
+ * only; the stored session keeps every message so nothing is lost on disk.
+ */
 function truncateForSend(
   session: { messages: ChatMessage[] },
   limitTokens: number,
   stderr: NodeJS.WriteStream,
 ): ChatMessage[] {
-  const estimated = estimateTokens(session.messages);
-  if (estimated > limitTokens) {
-    const result = truncateToLimit(session.messages, limitTokens);
-    session.messages = result.messages;
+  const plan = planRequest(session.messages, limitTokens);
+  if (plan.dropped > 0) {
     stderr.write(
-      `警告：上下文超限（估算 ${estimated.toLocaleString()} tokens > ${limitTokens.toLocaleString()}），已裁剪最早的 ${result.dropped} 条消息。\n`,
+      `警告：上下文超限（估算 ${plan.estimated.toLocaleString()} tokens > ${limitTokens.toLocaleString()}），本次请求省略最早的 ${plan.dropped} 条消息（本地历史保留）。\n`,
     );
-  } else if (estimated > limitTokens * 0.8) {
+  } else if (plan.nearLimit) {
     stderr.write(
-      `警告：上下文较长（估算 ${estimated.toLocaleString()} tokens，上限 ${limitTokens.toLocaleString()}）。\n`,
+      `警告：上下文较长（估算 ${plan.estimated.toLocaleString()} tokens，上限 ${limitTokens.toLocaleString()}）。\n`,
     );
   }
-  return session.messages;
+  return plan.messages;
+}
+
+/** Reads a piped prompt so `cat notes.md | deepseek` works in scripts. */
+async function readPipedPrompt(stream: NodeJS.ReadableStream = process.stdin): Promise<string> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of stream) chunks.push(Buffer.from(chunk));
+  return Buffer.concat(chunks).toString("utf8").trim();
 }
 
 async function standaloneLogin(store: ConfigStore, config: AppConfig): Promise<void> {
@@ -334,6 +342,22 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     else if (options.prompt) {
       await runOneShot({
         prompt: options.prompt,
+        config,
+        configStore,
+        sessionStore,
+        cwd,
+        ...(options.resume !== undefined ? { resume: options.resume } : {}),
+        continueLast: options.continueLast,
+        showReasoning: config.showReasoning,
+      });
+    } else if (!process.stdin.isTTY) {
+      // Non-interactive with no argument: treat piped stdin as the prompt.
+      const piped = await readPipedPrompt();
+      if (!piped) {
+        throw new Error('交互模式需要 TTY；请使用 deepseek "你的问题"，或通过管道传入内容');
+      }
+      await runOneShot({
+        prompt: piped,
         config,
         configStore,
         sessionStore,

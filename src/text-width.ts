@@ -1,4 +1,14 @@
-/** Terminal display-width helpers shared by menu and context rendering. */
+/** Terminal display-width helpers shared by menu, logo and context rendering. */
+
+/** CSI escape sequences — the only escape family this client emits. */
+const ANSI_CSI_GLOBAL = /\u001b\[[0-?]*[ -/]*[@-~]/gu;
+const ANSI_CSI_STICKY = /\u001b\[[0-?]*[ -/]*[@-~]/uy;
+const RESET = "\u001b[0m";
+
+/** Removes SGR/CSI sequences so only printable cells remain. */
+export function stripAnsi(value: string): string {
+  return value.replace(ANSI_CSI_GLOBAL, "");
+}
 
 export function isWideCodePoint(codePoint: number): boolean {
   return (
@@ -18,38 +28,72 @@ export function isWideCodePoint(codePoint: number): boolean {
   );
 }
 
-/** Display width of a plain (ANSI-free) string: CJK counts as two cells. */
+function isZeroWidth(character: string, codePoint: number): boolean {
+  return codePoint <= 0x1f || (codePoint >= 0x7f && codePoint <= 0x9f) || /\p{Mark}/u.test(character);
+}
+
+/** Display width of a string: ANSI sequences are free, CJK counts as two cells. */
 export function visibleWidth(value: string): number {
   let width = 0;
-  for (const character of value) {
+  for (const character of stripAnsi(value)) {
     const codePoint = character.codePointAt(0) ?? 0;
-    if (codePoint <= 0x1f || (codePoint >= 0x7f && codePoint <= 0x9f)) continue;
-    if (/\p{Mark}/u.test(character)) continue;
+    if (isZeroWidth(character, codePoint)) continue;
     width += isWideCodePoint(codePoint) ? 2 : 1;
   }
   return width;
 }
 
 /**
- * Clips a string to a terminal display width. ANSI control sequences and
- * combining marks are preserved but count zero cells; CJK counts two.
+ * Clips a string to a terminal display width. Strings that already fit are
+ * returned untouched; longer ones end in `…`. ANSI sequences are copied
+ * verbatim and cost no cells, so colored text clips at the same column as
+ * the equivalent plain text.
  */
 export function clipToWidth(value: string, width: number): string {
   if (width <= 0) return "";
+  if (visibleWidth(value) <= width) return value;
+  if (width === 1) return "…";
   let used = 0;
   let result = "";
-  for (const character of value) {
-    const codePoint = character.codePointAt(0) ?? 0;
-    const zeroWidth =
-      codePoint <= 0x1f || (codePoint >= 0x7f && codePoint <= 0x9f) || /\p{Mark}/u.test(character);
-    if (zeroWidth) {
+  let styled = false;
+  let index = 0;
+  while (index < value.length) {
+    ANSI_CSI_STICKY.lastIndex = index;
+    const escape = ANSI_CSI_STICKY.exec(value);
+    if (escape?.[0]) {
+      result += escape[0];
+      index = ANSI_CSI_STICKY.lastIndex;
+      styled = true;
+      continue;
+    }
+    const codePoint = value.codePointAt(index) ?? 0;
+    const character = String.fromCodePoint(codePoint);
+    index += character.length;
+    if (isZeroWidth(character, codePoint)) {
       result += character;
       continue;
     }
     const advance = isWideCodePoint(codePoint) ? 2 : 1;
-    if (used + advance > width - 1) return `${result}…`;
+    if (used + advance > width - 1) break;
     result += character;
     used += advance;
   }
-  return result;
+  // Clipping can cut a string before its closing SGR; reset so the discarded
+  // tail's color cannot bleed across the rest of the line.
+  return `${result}…${styled ? RESET : ""}`;
+}
+
+export type Align = "left" | "center" | "right";
+
+/** Clips then pads a string to exactly `width` display cells. */
+export function padToWidth(value: string, width: number, align: Align = "left"): string {
+  if (width <= 0) return "";
+  const clipped = clipToWidth(value, width);
+  const remaining = Math.max(0, width - visibleWidth(clipped));
+  if (align === "center") {
+    const left = Math.floor(remaining / 2);
+    return `${" ".repeat(left)}${clipped}${" ".repeat(remaining - left)}`;
+  }
+  if (align === "right") return `${" ".repeat(remaining)}${clipped}`;
+  return `${clipped}${" ".repeat(remaining)}`;
 }

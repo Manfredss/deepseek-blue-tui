@@ -1,7 +1,7 @@
 import type { Theme } from "./theme.js";
 import type { TokenUsage } from "./types.js";
 import { formatCompactTokens } from "./session-tools.js";
-import { clipToWidth } from "./text-width.js";
+import { clipToWidth, padToWidth } from "./text-width.js";
 
 /**
  * Context HUD and report renderers (dsh-TUI 借鉴的上下文可观测性，适配行式 REPL)。
@@ -61,30 +61,56 @@ export function renderContextHud(theme: Theme, state: ContextViewState, options:
 }
 
 const BAR_WIDTH = 20;
+const LABEL_WIDTH = 8;
 
-function contextBar(state: ContextViewState): string {
-  const percent = safePercent(state.estimatedTokens, state.limitTokens);
-  const used = percent === undefined ? 0 : Math.min(BAR_WIDTH, Math.round((percent / 100) * BAR_WIDTH));
-  return "█".repeat(used) + "░".repeat(BAR_WIDTH - used);
+/** Proportional block bar tinted by pressure: blue → yellow → red. */
+export function renderPressureBar(theme: Theme, percent: number | undefined, width = BAR_WIDTH): string {
+  const used = percent === undefined ? 0 : Math.min(width, Math.round((percent / 100) * width));
+  const filled = "█".repeat(used);
+  const empty = "░".repeat(Math.max(0, width - used));
+  const tint = percent !== undefined && percent >= 100 ? theme.red : percent !== undefined && percent >= 80 ? theme.yellow : theme.blue;
+  return `${tint(filled)}${theme.muted(empty)}`;
+}
+
+function row(theme: Theme, label: string, value: string): string {
+  return `${theme.muted(padToWidth(label, LABEL_WIDTH))}  ${value}`;
 }
 
 /** Multi-line context report: token accounting, cache, access, and cwd. */
 export function renderContextReport(theme: Theme, state: ContextViewState, options: { columns: number }): string {
   const columns = Number.isFinite(options.columns) ? Math.max(16, Math.floor(options.columns)) : 78;
-  const bar = contextBar(state);
   const percent = safePercent(state.estimatedTokens, state.limitTokens);
+  const bar = renderPressureBar(theme, percent);
   const lines = [
-    `${theme.bold("上下文报告")}`,
-    `模型      ${state.model}`,
-    `上下文    ${percentText(theme, state.estimatedTokens, state.limitTokens)} ${bar} ${formatCompactTokens(state.estimatedTokens)}/${formatCompactTokens(state.limitTokens)} tokens（估算）`,
-    `消息      ${state.messageCount.toLocaleString()} 条`,
-    `思考过程  ${state.showReasoning ? "显示" : "隐藏"}`,
-    `会话状态  ${accessText(state.readOnly)}${state.readOnly ? "（只读：消息不会保存）" : ""}`,
-    apiText(state.apiKeyConfigured),
-    `累计 Token ${state.usage.totalTokens.toLocaleString()}（输入 ${state.usage.promptTokens.toLocaleString()} · 输出 ${state.usage.completionTokens.toLocaleString()} · 思考 ${state.usage.reasoningTokens.toLocaleString()}）`,
-    `缓存      命中 ${state.usage.promptCacheHitTokens.toLocaleString()} · 未命中 ${state.usage.promptCacheMissTokens.toLocaleString()}`,
-    `工作目录  ${state.cwd}`,
+    theme.bold("上下文报告"),
+    row(
+      theme,
+      "上下文",
+      `${percentText(theme, state.estimatedTokens, state.limitTokens)} ${bar} ${formatCompactTokens(state.estimatedTokens)}/${formatCompactTokens(state.limitTokens)} tokens（估算）`,
+    ),
+    row(theme, "模型", state.model),
+    row(theme, "消息", `${state.messageCount.toLocaleString()} 条`),
+    row(theme, "思考过程", `${state.showReasoning ? "显示" : "隐藏"}（${reasoningText(state.showReasoning)}）`),
+    row(
+      theme,
+      "会话状态",
+      `${accessText(state.readOnly)}${state.readOnly ? "（只读：消息不会保存）" : "（可写）"}`,
+    ),
+    row(theme, "凭据", `${apiText(state.apiKeyConfigured)}${state.apiKeyConfigured ? "（已配置）" : "（未配置）"}`),
+    row(
+      theme,
+      "累计",
+      `${state.usage.totalTokens.toLocaleString()} tokens（输入 ${state.usage.promptTokens.toLocaleString()} · 输出 ${state.usage.completionTokens.toLocaleString()} · 思考 ${state.usage.reasoningTokens.toLocaleString()}）`,
+    ),
+    row(
+      theme,
+      "缓存",
+      `命中 ${state.usage.promptCacheHitTokens.toLocaleString()} · 未命中 ${state.usage.promptCacheMissTokens.toLocaleString()}`,
+    ),
+    row(theme, "工作目录", state.cwd),
   ];
-  if (percent === undefined) lines.push("注意：contextLimitTokens 无效，无法计算上下文占用比例");
+  if (percent === undefined) {
+    lines.push(theme.yellow("注意：contextLimitTokens 无效，无法计算上下文占用比例"));
+  }
   return lines.map((line) => clipToWidth(line, columns)).join("\n");
 }

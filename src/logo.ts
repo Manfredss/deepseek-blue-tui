@@ -1,4 +1,5 @@
 import type { Theme } from "./theme.js";
+import { clipToWidth, padToWidth, visibleWidth } from "./text-width.js";
 
 const DETAILED_WHALE = [
   "         ▄▄▄▄▄▄▄▄▄▄▄██      ██▄",
@@ -224,66 +225,6 @@ interface Cell {
   tone?: CellTone;
 }
 
-const ANSI_ESCAPE = /\u001b\[[0-?]*[ -/]*[@-~]/gu;
-
-function stripAnsi(value: string): string {
-  return value.replace(ANSI_ESCAPE, "");
-}
-
-function isWideCodePoint(codePoint: number): boolean {
-  return (
-    codePoint >= 0x1100 &&
-    (codePoint <= 0x115f ||
-      codePoint === 0x2329 ||
-      codePoint === 0x232a ||
-      (codePoint >= 0x2e80 && codePoint <= 0xa4cf && codePoint !== 0x303f) ||
-      (codePoint >= 0xac00 && codePoint <= 0xd7a3) ||
-      (codePoint >= 0xf900 && codePoint <= 0xfaff) ||
-      (codePoint >= 0xfe10 && codePoint <= 0xfe19) ||
-      (codePoint >= 0xfe30 && codePoint <= 0xfe6f) ||
-      (codePoint >= 0xff00 && codePoint <= 0xff60) ||
-      (codePoint >= 0xffe0 && codePoint <= 0xffe6) ||
-      (codePoint >= 0x1f300 && codePoint <= 0x1faff) ||
-      (codePoint >= 0x20000 && codePoint <= 0x3fffd))
-  );
-}
-
-function displayWidth(value: string): number {
-  let width = 0;
-  for (const character of stripAnsi(value)) {
-    const codePoint = character.codePointAt(0) ?? 0;
-    if (codePoint <= 0x1f || (codePoint >= 0x7f && codePoint <= 0x9f)) continue;
-    if (/\p{Mark}/u.test(character)) continue;
-    width += isWideCodePoint(codePoint) ? 2 : 1;
-  }
-  return width;
-}
-
-function truncate(value: string, width: number): string {
-  if (width <= 0) return "";
-  if (displayWidth(value) <= width) return value;
-  if (width === 1) return "…";
-  let result = "";
-  let used = 0;
-  for (const character of value) {
-    const characterWidth = isWideCodePoint(character.codePointAt(0) ?? 0) ? 2 : 1;
-    if (used + characterWidth > width - 1) break;
-    result += character;
-    used += characterWidth;
-  }
-  return `${result}…`;
-}
-
-function pad(value: string, width: number, align: "left" | "center" = "left"): string {
-  const clipped = truncate(value, width);
-  const remaining = Math.max(0, width - displayWidth(clipped));
-  if (align === "center") {
-    const left = Math.floor(remaining / 2);
-    return `${" ".repeat(left)}${clipped}${" ".repeat(remaining - left)}`;
-  }
-  return `${clipped}${" ".repeat(remaining)}`;
-}
-
 function normalizedColumns(columns: number | undefined, fallback = 72): number {
   if (columns === undefined || !Number.isFinite(columns)) return fallback;
   return Math.max(16, Math.min(110, Math.floor(columns)));
@@ -294,7 +235,7 @@ function whaleFor(columns: number): readonly string[] {
 }
 
 function styleCell(theme: Theme, cell: Cell, width: number): string {
-  const value = pad(cell.text, width, cell.align);
+  const value = padToWidth(cell.text, width, cell.align);
   switch (cell.tone) {
     case "muted":
       return theme.muted(value);
@@ -324,8 +265,8 @@ function styleWhale(theme: Theme, value: string): string {
 function topBorder(theme: Theme, width: number, title: string): string {
   const innerWidth = Math.max(0, width - 2);
   if (innerWidth === 0) return theme.blue("╭╮".slice(0, width));
-  const label = truncate(`─ ${title} `, innerWidth);
-  return theme.blue(`╭${label}${"─".repeat(Math.max(0, innerWidth - displayWidth(label)))}╮`);
+  const label = clipToWidth(`─ ${title} `, innerWidth);
+  return theme.blue(`╭${label}${"─".repeat(Math.max(0, innerWidth - visibleWidth(label)))}╮`);
 }
 
 function bottomBorder(theme: Theme, width: number): string {
@@ -365,11 +306,11 @@ function compactPath(value: string): string {
 export function renderLogo(theme: Theme, options: LogoOptions = {}): string {
   const columns = normalizedColumns(options.columns);
   const whale = whaleFor(columns);
-  const lines = whale.map((line) => styleWhale(theme, pad(line, columns, "center")));
-  const fullTitle = columns >= displayWidth("DeepSeek Terminal");
-  const plainTitle = truncate(fullTitle ? "DeepSeek Terminal" : "DeepSeek", columns);
+  const lines = whale.map((line) => styleWhale(theme, padToWidth(line, columns, "center")));
+  const fullTitle = columns >= visibleWidth("DeepSeek Terminal");
+  const plainTitle = clipToWidth(fullTitle ? "DeepSeek Terminal" : "DeepSeek", columns);
   const title = fullTitle ? `${theme.bold("DeepSeek")} ${theme.muted("Terminal")}` : theme.bold(plainTitle);
-  const titleWidth = displayWidth(plainTitle);
+  const titleWidth = visibleWidth(plainTitle);
   const left = Math.max(0, Math.floor((columns - titleWidth) / 2));
   lines.push(`${" ".repeat(left)}${title}`);
   return `${lines.join("\n")}\n`;
@@ -380,13 +321,13 @@ export function renderWelcomeScreen(theme: Theme, options: WelcomeScreenOptions)
   const width = normalizedColumns(options.columns, 92);
   const compactHeight = options.rows !== undefined && Number.isFinite(options.rows) && options.rows < 20;
   const username = options.username?.replace(/[\r\n\t]/gu, " ").trim() || "friend";
-  const apiStatus = options.apiKeyConfigured ? "API key connected" : "API key not configured";
+  const apiStatus = options.apiKeyConfigured ? "API Key 已就绪" : "尚未配置 API Key";
   const title = `DeepSeek TUI v${options.version}`;
   const lines = [topBorder(theme, width, title)];
 
   if (compactHeight) {
     const compactRows: Cell[] = [
-      { text: `Welcome back, ${username}!`, align: "center" },
+      { text: `欢迎回来，${username}`, align: "center" },
       ...MINI_WHALE.map((text): Cell => ({ text, align: "center", tone: "whale" })),
       { text: `${options.model} · ${apiStatus}`, align: "center", tone: "muted" },
       { text: compactPath(options.cwd), align: "center", tone: "muted" },
@@ -402,22 +343,22 @@ export function renderWelcomeScreen(theme: Theme, options: WelcomeScreenOptions)
     const whale = pixelWhale ?? (hasDetailedWhaleSpace ? DETAILED_WHALE : LARGE_WHALE);
     const whaleTone: CellTone = pixelWhale ? "raw" : "whale";
     const left: Cell[] = [
-      { text: `Welcome back, ${username}!`, align: "center", tone: "normal" },
+      { text: `欢迎回来，${username}`, align: "center", tone: "normal" },
       ...whale.map((text): Cell => ({ text, align: "center", tone: whaleTone })),
       { text: `${options.model} · ${apiStatus}`, align: "center", tone: "muted" },
       { text: compactPath(options.cwd), align: "center", tone: "muted" },
     ];
     const right: Cell[] = [
-      { text: "Tips for getting started", tone: "heading" },
-      { text: "/login   Configure your API key" },
-      { text: "/model   Switch the DeepSeek model" },
-      { text: "/resume  Continue a past conversation" },
-      { text: "/clear   Start a fresh conversation" },
+      { text: "快速上手", tone: "heading" },
+      { text: "/login    配置 API Key" },
+      { text: "/model    切换 DeepSeek 模型" },
+      { text: "/resume   继续一段历史会话" },
+      { text: "/clear    开始新的会话" },
       { text: "DeepSeek Harness", tone: "heading" },
-      { text: "/dsh     Open the managed Web companion" },
-      { text: "/usage   View API usage and top up" },
-      { text: "/help    Show every command" },
-      { text: "Unofficial client · Harness sessions stay separate", tone: "muted" },
+      { text: "/dsh      打开官方 Harness Web" },
+      { text: "/usage    查询余额与用量" },
+      { text: "/help     查看全部命令" },
+      { text: "非官方社区客户端 · Harness 会话独立", tone: "muted" },
     ];
     const height = Math.max(left.length, right.length);
     for (let index = 0; index < height; index += 1) {
@@ -435,15 +376,15 @@ export function renderWelcomeScreen(theme: Theme, options: WelcomeScreenOptions)
     const contentWidth = Math.max(0, width - 4);
     const whale = contentWidth >= 16 ? SMALL_WHALE : whaleFor(contentWidth);
     const rows: Cell[] = [
-      { text: `Welcome back, ${username}!`, align: "center" },
+      { text: `欢迎回来，${username}`, align: "center" },
       ...whale.map((text): Cell => ({ text, align: "center", tone: "whale" })),
       { text: options.model, align: "center", tone: "muted" },
       { text: apiStatus, align: "center", tone: "muted" },
       { text: compactPath(options.cwd), align: "center", tone: "muted" },
-      { text: "Quick start", tone: "heading" },
+      { text: "快速上手", tone: "heading" },
       { text: "/login · /model · /resume · /clear" },
-      { text: "/dsh Harness Web · /help commands", tone: "muted" },
-      { text: "Unofficial community client", align: "center", tone: "muted" },
+      { text: "/dsh Harness Web · /help 全部命令", tone: "muted" },
+      { text: "非官方社区客户端", align: "center", tone: "muted" },
     ];
     for (const row of rows) lines.push(singleRow(theme, width, row));
   }

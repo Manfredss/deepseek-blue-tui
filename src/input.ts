@@ -20,6 +20,41 @@ export interface TerminalSize {
 
 export interface LineInputNextOptions {
   suggestions?: boolean;
+  /** Set false for throwaway prompts (confirmations) that must not be recalled. */
+  history?: boolean;
+  /**
+   * Prompt used for continuation lines. When set, a line ending in a single
+   * backslash keeps the editor open and the parts are joined with newlines.
+   */
+  continuation?: string;
+}
+
+export interface LineInputHistory {
+  /** Chronological entries (oldest first); mutated as new lines are typed. */
+  entries: string[];
+  /** Called with every newly recorded entry so callers can persist it. */
+  append?: (entry: string) => void;
+  /** Return false to keep an entry out of history (e.g. `/exit`). */
+  accepts?: (entry: string) => boolean;
+}
+
+const HISTORY_LIMIT = 500;
+const SECRET_LIKE = /\bsk-[A-Za-z0-9_-]{8,}/u;
+
+/** Longest prefix shared by every candidate ("" when they diverge at once). */
+function commonPrefix(values: readonly string[]): string {
+  let prefix = values[0] ?? "";
+  for (const value of values) {
+    while (prefix && !value.startsWith(prefix)) prefix = prefix.slice(0, -1);
+    if (!prefix) break;
+  }
+  return prefix;
+}
+
+/** A single trailing backslash continues the message on the next line. */
+function hasContinuation(line: string): boolean {
+  const match = /\\+$/u.exec(line);
+  return match !== null && match[0].length % 2 === 1;
 }
 
 export interface SuggestionMenu {
@@ -42,6 +77,8 @@ type ResizeHandler = (size: TerminalSize) => void;
 interface Keypress {
   name?: string | undefined;
   ctrl?: boolean;
+  meta?: boolean;
+  shift?: boolean;
   sequence?: string;
   code?: string;
 }
@@ -193,6 +230,8 @@ export class LineInput {
   private suggestionLine: string | undefined;
   private suggestionSelection = -1;
   private suggestionValues: readonly string[] = [];
+  private readonly history: LineInputHistory | undefined;
+  private historyEnabled = true;
   onInterrupt?: () => void;
 
   constructor(options: {
@@ -201,12 +240,14 @@ export class LineInput {
     completer?: Completer;
     suggestions?: SuggestionProvider;
     onResize?: ResizeHandler;
+    history?: LineInputHistory;
   } = {}) {
     this.input = options.input ?? process.stdin;
     this.output = options.output ?? process.stdout;
     if (options.completer) this.completer = options.completer;
     if (options.suggestions) this.suggestions = options.suggestions;
     if (options.onResize) this.onResize = options.onResize;
+    this.history = options.history;
     if ((this.input as NodeJS.ReadStream).isTTY) {
       this.pasteInput = new BracketedPasteInput(
         (value) => this.replacePaste(value),
@@ -217,14 +258,22 @@ export class LineInput {
     }
     this.terminalInput = this.pasteInput ?? this.input;
     this.interface = this.create(this.terminalInput);
-    if ((this.terminalInput as NodeJS.ReadStream).isTTY && this.suggestions) {
+    if ((this.terminalInput as NodeJS.ReadStream).isTTY) {
       this.terminalInput.prependListener("keypress", this.handleKeypress);
       this.output.on("resize", this.handleResize);
     }
   }
 
   private readonly handleKeypress = (_character: string | undefined, key: Keypress = {}): void => {
-    if (!this.suggestionsActive || this.closed) return;
+    if (this.closed) return;
+    if (key.ctrl && key.name === "l") {
+      // readline clears the screen itself; forget the overlay rows that
+      // scrolled away with it so the next repaint re-allocates from scratch.
+      this.menuCapacity = 0;
+      if (this.suggestionsActive) this.scheduleSuggestionRefresh();
+      return;
+    }
+    if (!this.suggestionsActive) return;
     if (key.name === "escape") {
       this.suggestionSelection = -1;
       this.suggestionValues = [];
@@ -237,6 +286,19 @@ export class LineInput {
       this.promptEpoch += 1;
       this.eraseMenuFromPrompt();
       return;
+    }
+    if (key.name === "tab" && !key.ctrl && !key.meta && !key.shift) {
+      if (this.completeFromSuggestions()) {
+        // readline's default branch inserts the *character* it was handed, so
+        // clearing `key.name` (enough for arrows) would still leave a literal
+        // tab in the line. Routing the key into the ctrl switch drops it.
+        key.ctrl = true;
+        key.name = undefined;
+        key.sequence = "";
+        key.code = "";
+        this.scheduleSuggestionRefresh();
+        return;
+      }
     }
     if (key.name === "up" || key.name === "down") {
       if (this.dismissedLine !== this.interface.line) {
@@ -275,6 +337,42 @@ export class LineInput {
       direction === "up"
         ? Math.max(0, this.suggestionSelection - 1)
         : Math.min(count - 1, this.suggestionSelection + 1);
+  }
+
+  /**
+   * Tab completion against the live palette: takes the highlighted candidate,
+   * otherwise grows the line by the prefix all candidates share. When the
+   * prefix cannot grow it highlights the first candidate instead, so a second
+   * Tab (or Enter) commits it. Returns whether anything changed.
+   */
+  private completeFromSuggestions(): boolean {
+    if (!this.suggestions) return false;
+    const line = this.interface.line;
+    const menu = this.normalizeSuggestion(this.suggestions(line, this.terminalSize(), this.suggestionSelection));
+    const values = menu.values ?? [];
+    if (values.length === 0) return false;
+    this.suggestionValues = values;
+    // Tab is an explicit request, so it reopens a palette dismissed with Esc.
+    this.dismissedLine = undefined;
+    const selected = this.suggestionSelection;
+    const highlighted = selected >= 0 && selected < values.length ? values[selected] : undefined;
+    const target = highlighted ?? commonPrefix(values);
+    if (target.length > line.length) {
+      this.replaceLine(target);
+      this.suggestionLine = target;
+      this.suggestionSelection = -1;
+      return true;
+    }
+    if (highlighted !== undefined) return false;
+    this.suggestionSelection = 0;
+    return true;
+  }
+
+  /** Replaces the line editor's content through readline's own edit keys. */
+  private replaceLine(value: string): void {
+    this.interface.write(null, { ctrl: true, name: "e" });
+    this.interface.write(null, { ctrl: true, name: "u" });
+    if (value) this.interface.write(value);
   }
 
   private confirmSuggestionIntoLine(): void {
@@ -422,6 +520,7 @@ export class LineInput {
     };
     if (this.completer) options.completer = this.completer;
     const instance = createInterface(options);
+    this.seedHistory(instance);
     instance.on("line", (line) => {
       this.suggestionsActive = false;
       this.dismissedLine = undefined;
@@ -430,6 +529,7 @@ export class LineInput {
       this.suggestionSelection = -1;
       this.suggestionValues = [];
       line = this.restorePastes(line);
+      if (this.historyEnabled) this.recordHistory(line);
       const waiter = this.waiters.shift();
       if (waiter) waiter(line);
       else this.queued.push(line);
@@ -453,8 +553,27 @@ export class LineInput {
   }
 
   async next(prompt: string, options: LineInputNextOptions = {}): Promise<string | undefined> {
-    if (this.queued.length > 0) return this.queued.shift();
+    const continuation = options.continuation;
+    let line = await this.readLine(prompt, options);
+    if (line === undefined || continuation === undefined) return line;
+    while (hasContinuation(line)) {
+      const more = await this.readLine(continuation, {});
+      if (more === undefined) return line.slice(0, -1);
+      line = `${line.slice(0, -1)}\n${more}`;
+    }
+    return line;
+  }
+
+  private async readLine(prompt: string, options: LineInputNextOptions): Promise<string | undefined> {
+    if (this.queued.length > 0) {
+      const queued = this.queued.shift();
+      // Type-ahead captured while the prompt was suspended never went through
+      // the line editor, so echo it: an unexplained reply is disorienting.
+      if (queued !== undefined) this.output.write(`${prompt}${queued}\n`);
+      return queued;
+    }
     if (this.closed) return undefined;
+    this.historyEnabled = options.history ?? true;
     this.promptEpoch += 1;
     this.lastPrompt = prompt;
     this.suggestionsActive = options.suggestions ?? false;
@@ -517,7 +636,7 @@ export class LineInput {
     }
     this.terminalInput = this.pasteInput ?? this.input;
     this.interface = this.create(this.terminalInput);
-    if ((this.terminalInput as NodeJS.ReadStream).isTTY && this.suggestions) {
+    if ((this.terminalInput as NodeJS.ReadStream).isTTY) {
       this.terminalInput.prependListener("keypress", this.handleKeypress);
     }
     if (this.waiters.length > 0) {
@@ -536,6 +655,67 @@ export class LineInput {
     for (const line of segments.slice(0, -1)) {
       if (line.length > 0) this.queued.push(line);
     }
+  }
+
+  /** True while a prompt is waiting for the user to submit a line. */
+  isPrompting(): boolean {
+    return !this.closed && this.waiters.length > 0;
+  }
+
+  /** The text currently held by the line editor. */
+  currentLine(): string {
+    return this.closed ? "" : this.interface.line;
+  }
+
+  /** Empties the line editor and hides any visible suggestion overlay. */
+  resetLine(): void {
+    if (this.closed) return;
+    this.replaceLine("");
+    this.suggestionLine = undefined;
+    this.suggestionSelection = -1;
+    this.suggestionValues = [];
+    this.dismissedLine = undefined;
+    this.eraseMenuFromPrompt();
+    this.menuCapacity = 0;
+  }
+
+  /** Prints a line above the active prompt, then redraws the prompt. */
+  notice(text: string): void {
+    if (this.closed) {
+      this.output.write(`${text}\n`);
+      return;
+    }
+    this.eraseMenuFromPrompt();
+    this.menuCapacity = 0;
+    clearLine(this.output as NodeJS.WriteStream, 0);
+    cursorTo(this.output as NodeJS.WriteStream, 0);
+    this.output.write(`${text}\n`);
+    this.interface.prompt(true);
+  }
+
+  private seedHistory(instance: Interface): void {
+    const entries = this.history?.entries;
+    if (!entries || entries.length === 0) return;
+    const editable = instance as unknown as { history?: unknown };
+    if (!Array.isArray(editable.history)) return;
+    editable.history = entries.slice(-HISTORY_LIMIT).reverse();
+  }
+
+  private recordHistory(line: string): void {
+    const history = this.history;
+    if (!history) return;
+    const value = line.trim();
+    // Skip blanks, repeats, restored multi-line pastes and anything that
+    // looks like a credential — the history file lives on disk.
+    if (!value || value.length > 1_000 || /[\r\n]/u.test(value)) return;
+    if (SECRET_LIKE.test(value)) return;
+    if (history.accepts && !history.accepts(value)) return;
+    if (history.entries[history.entries.length - 1] === value) return;
+    history.entries.push(value);
+    if (history.entries.length > HISTORY_LIMIT) {
+      history.entries.splice(0, history.entries.length - HISTORY_LIMIT);
+    }
+    history.append?.(value);
   }
 
   close(): void {
@@ -596,6 +776,8 @@ export class MenuPicker {
 
   run(options: MenuPickerOptions): Promise<MenuPickerResult> {
     if (!this.input.isTTY) return Promise.reject(new Error("菜单选择需要 TTY 环境"));
+    // Nothing to point at: an empty list would otherwise confirm index 0.
+    if (options.items.length === 0 && !options.allowCustom) return Promise.resolve(undefined);
     const color: MenuPickerColor = options.color ?? { accent: (value) => value, muted: (value) => value };
     this.selected = Math.max(0, Math.min(options.items.length - 1, options.initial ?? 0));
     this.printedLines = 0;
