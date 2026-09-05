@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
@@ -170,13 +171,17 @@ test("editPrompt runs the editor, reads the draft back, and reports failures", a
   const marker = join(directory, "editor-ran.txt");
 
   // Emulate the editor writing into the draft file (its last argument),
-  // which is exactly what a real editor does on save.
+  // which is exactly what a real editor does on save. The writes must be
+  // synchronous: this stands in for spawnSync, so editPrompt reads the draft
+  // back the instant this returns. Firing unawaited promise writes here left
+  // the draft truncated-but-empty at that moment, which surfaced as a flaky
+  // "编辑器内容为空" failure on slower runners.
   const spawnImpl = ((command: string, args: string[]) => {
     if (command !== fakeEditor) return { status: 0, error: undefined, stdout: "", stderr: "" };
     const target = args.at(-1);
     if (target) {
-      writeFile(target, "编辑后的多行内容\n第二行\n", "utf8");
-      writeFile(marker, "ran\n", "utf8");
+      writeFileSync(target, "编辑后的多行内容\n第二行\n", "utf8");
+      writeFileSync(marker, "ran\n", "utf8");
     }
     return { status: 0, error: undefined, stdout: "", stderr: "" };
   }) as unknown as typeof import("node:child_process")["spawnSync"];
