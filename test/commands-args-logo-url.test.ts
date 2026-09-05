@@ -43,7 +43,7 @@ test("slash escaping and completion behave like terminal commands", () => {
   assert.deepEqual(completeSlashCommand("/mo"), [["/model"], "/mo"]);
   assert.deepEqual(completeSlashCommand("/unknown"), [[], "/unknown"]);
   assert.deepEqual(completeSlashCommand("/model deep"), [[], "/model deep"]);
-  assert.match(commandHelp(), /\/dsh \[install\|start\|open\|status\|stop\|logs\|restart\]/);
+  assert.match(commandHelp(), /\/dsh \[子命令\][^\n]*install\/start\/open\/status\/stop\/logs\/restart/);
   assert.match(commandHelp(), /输入 \/\//);
 });
 

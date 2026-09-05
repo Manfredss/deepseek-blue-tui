@@ -1,5 +1,5 @@
 import type { Theme } from "./theme.js";
-import { clipToWidth, padToWidth, visibleWidth } from "./text-width.js";
+import { clipToWidth, padToWidth, shortenPath, visibleWidth } from "./text-width.js";
 
 const DETAILED_WHALE = [
   "         ▄▄▄▄▄▄▄▄▄▄▄██      ██▄",
@@ -211,6 +211,8 @@ export interface LogoOptions {
 export interface WelcomeScreenOptions extends LogoOptions {
   rows?: number;
   cwd: string;
+  /** Home directory, so a long cwd can render as `~/…/project`. */
+  home?: string;
   model: string;
   version: string;
   apiKeyConfigured: boolean;
@@ -294,9 +296,13 @@ function twoColumnRow(
   return `${theme.blue("│")}${paddedCell(left, leftWidth)}${theme.blue("│")}${paddedCell(right, rightWidth)}${theme.blue("│")}`;
 }
 
-function compactPath(value: string): string {
-  const normalized = value.replace(/[\r\n\t]/gu, " ").trim();
-  return normalized || ".";
+/**
+ * Working directory for the welcome card. `home` collapses to `~` and an
+ * over-long path keeps its tail, so the project folder — the part that says
+ * which conversation this is — survives a narrow terminal.
+ */
+function compactPath(value: string, width: number, home?: string): string {
+  return shortenPath(value, Math.max(4, width), home);
 }
 
 /**
@@ -330,7 +336,7 @@ export function renderWelcomeScreen(theme: Theme, options: WelcomeScreenOptions)
       { text: `欢迎回来，${username}`, align: "center" },
       ...MINI_WHALE.map((text): Cell => ({ text, align: "center", tone: "whale" })),
       { text: `${options.model} · ${apiStatus}`, align: "center", tone: "muted" },
-      { text: compactPath(options.cwd), align: "center", tone: "muted" },
+      { text: compactPath(options.cwd, width - 4, options.home), align: "center", tone: "muted" },
       { text: "/login · /model · /resume · /dsh · /help", align: "center", tone: "muted" },
     ];
     for (const row of compactRows) lines.push(singleRow(theme, width, row));
@@ -346,7 +352,7 @@ export function renderWelcomeScreen(theme: Theme, options: WelcomeScreenOptions)
       { text: `欢迎回来，${username}`, align: "center", tone: "normal" },
       ...whale.map((text): Cell => ({ text, align: "center", tone: whaleTone })),
       { text: `${options.model} · ${apiStatus}`, align: "center", tone: "muted" },
-      { text: compactPath(options.cwd), align: "center", tone: "muted" },
+      { text: compactPath(options.cwd, leftWidth - 2, options.home), align: "center", tone: "muted" },
     ];
     const right: Cell[] = [
       { text: "快速上手", tone: "heading" },
@@ -380,7 +386,7 @@ export function renderWelcomeScreen(theme: Theme, options: WelcomeScreenOptions)
       ...whale.map((text): Cell => ({ text, align: "center", tone: "whale" })),
       { text: options.model, align: "center", tone: "muted" },
       { text: apiStatus, align: "center", tone: "muted" },
-      { text: compactPath(options.cwd), align: "center", tone: "muted" },
+      { text: compactPath(options.cwd, contentWidth, options.home), align: "center", tone: "muted" },
       { text: "快速上手", tone: "heading" },
       { text: "/login · /model · /resume · /clear" },
       { text: "/dsh Harness Web · /help 全部命令", tone: "muted" },

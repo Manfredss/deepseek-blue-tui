@@ -116,7 +116,7 @@ dsh web --host 127.0.0.1 --port <port>
 
 本项目采用以下策略：
 
-- 不再把 `@deepseek-ai/dsh` 作为 npm 可选依赖（该依赖连带安装数百个包）；改为 `deepseek dsh install` 显式安装固定已验证版本 `0.1.0-rc.7`，检测到 `DEEPSEEK_DSH_COMMAND`、`PATH` 或开发环境本地安装时直接复用
+- 不再把 `@deepseek-ai/dsh` 作为 npm 可选依赖（该依赖连带安装数百个包）；改为 `deepseek dsh install` 显式安装 `latest`，检测到 `DEEPSEEK_DSH_COMMAND`、`PATH` 或开发环境本地安装时直接复用。版本号不硬编码，一律从实际安装的包清单读取
 - 用 detached child process 释放启动它的终端
 - 将 stdout/stderr 追加到单独日志；日志超过 1 MiB 自动轮转保留一份，展示日志时对 `sk-` 密钥、Bearer Token 和 Authorization 头做脱敏
 - 原子保存 PID、端口、URL、工作目录、启动时间和版本

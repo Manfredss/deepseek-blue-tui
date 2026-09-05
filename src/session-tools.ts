@@ -2,7 +2,7 @@ import { spawnSync } from "node:child_process";
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
-import { createSession, estimateTextTokens, estimateTokens } from "./session-store.js";
+import { createSession, estimateTextTokens, MESSAGE_OVERHEAD_TOKENS } from "./session-store.js";
 import type { ChatMessage, Session } from "./types.js";
 
 /**
@@ -51,30 +51,39 @@ export function buildContextBreakdown(
   width = 20,
 ): ContextBreakdown {
   const order: ChatMessage["role"][] = ["system", "user", "assistant"];
+  // Sums stay unrounded until the very end so the breakdown total matches
+  // `estimateTokens(messages)` exactly; rounding per message drifted upwards
+  // and made /context report two different totals for the same history.
   const tokens = new Map<ChatMessage["role"], number>();
   for (const message of messages) {
-    tokens.set(message.role, (tokens.get(message.role) ?? 0) + estimateTokens([message]));
+    tokens.set(message.role, (tokens.get(message.role) ?? 0) + MESSAGE_OVERHEAD_TOKENS + estimateTextTokens(message.content));
   }
   const reasoning = messages.reduce(
-    (sum, message) => sum + (message.reasoningContent ? Math.ceil(estimateTextTokens(message.reasoningContent)) : 0),
+    (sum, message) => sum + (message.reasoningContent ? estimateTextTokens(message.reasoningContent) : 0),
     0,
   );
   const roleTokens = [...tokens.values()].reduce((sum, value) => sum + value, 0);
-  const total = Math.max(1, roleTokens + reasoning);
+  const exact = roleTokens + reasoning;
+  const total = Math.max(1, exact);
   const segments: ContextSegment[] = [];
   for (const role of order) {
     const count = tokens.get(role) ?? 0;
     if (count === 0) continue;
-    segments.push({ role, label: role, tokens: count, percent: (count / total) * 100 });
+    segments.push({ role, label: role, tokens: Math.round(count), percent: (count / total) * 100 });
   }
   if (reasoning > 0) {
-    segments.push({ role: "thinking", label: "thinking", tokens: reasoning, percent: (reasoning / total) * 100 });
+    segments.push({
+      role: "thinking",
+      label: "thinking",
+      tokens: Math.round(reasoning),
+      percent: (reasoning / total) * 100,
+    });
   }
-  const used = Math.min(width, Math.round((total / limitTokens) * width));
+  const used = Math.min(width, Math.max(0, Math.round((total / limitTokens) * width)));
   const bar = "█".repeat(used) + "░".repeat(Math.max(0, width - used));
   return {
     segments,
-    total,
+    total: Math.ceil(exact),
     limit: limitTokens,
     percent: (total / limitTokens) * 100,
     bar,
@@ -190,7 +199,12 @@ export async function readAttachmentFile(
   try {
     info = await stat(path);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { ok: false, error: `文件不存在：${path}` };
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return { ok: false, error: `文件不存在：${path}` };
+    if (code === "EACCES" || code === "EPERM") return { ok: false, error: `没有读取权限：${path}` };
+    if (code === "ELOOP") return { ok: false, error: `符号链接循环：${path}` };
+    if (code === "ENAMETOOLONG") return { ok: false, error: `路径过长：${path}` };
+    if (code === "ENOTDIR") return { ok: false, error: `路径中有一段不是目录：${path}` };
     throw error;
   }
   if (!info.isFile()) return { ok: false, error: `不是普通文件：${path}` };
@@ -200,7 +214,15 @@ export async function readAttachmentFile(
       error: `文件过大（${Math.ceil(info.size / 1024)} KiB > ${Math.ceil(maxBytes / 1024)} KiB 上限），请只附加相关片段`,
     };
   }
-  const buffer = await readFile(path);
+  let buffer;
+  try {
+    buffer = await readFile(path);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "EACCES" || code === "EPERM") return { ok: false, error: `没有读取权限：${path}` };
+    if (code === "EISDIR") return { ok: false, error: `不是普通文件：${path}` };
+    throw error;
+  }
   if (buffer.includes(0)) return { ok: false, error: `看起来是二进制文件，无法作为文本附加：${path}` };
   const content = buffer.toString("utf8").replace(/\r\n/g, "\n").replace(/\n{3,}$/g, "\n\n").trimEnd();
   if (!content) return { ok: false, error: `文件为空：${path}` };

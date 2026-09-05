@@ -107,8 +107,11 @@ export function estimateTextTokens(value: string): number {
   return count;
 }
 
+/** Per-message protocol overhead folded into every token estimate. */
+export const MESSAGE_OVERHEAD_TOKENS = 4;
+
 export function estimateTokens(messages: ChatMessage[]): number {
-  let tokens = messages.length * 4; // Per-message protocol overhead.
+  let tokens = messages.length * MESSAGE_OVERHEAD_TOKENS;
   for (const message of messages) {
     tokens += estimateTextTokens(message.content);
     if (message.reasoningContent) tokens += estimateTextTokens(message.reasoningContent);
@@ -222,6 +225,9 @@ export class SessionStore {
     );
     const filtered = sessions
       .filter((session): session is Session => Boolean(session))
+      // An empty conversation is nothing to resume — offering it in the
+      // picker (or picking it up with --continue) only wastes a choice.
+      .filter((session) => session.messages.length > 0)
       .filter((session) => !options.cwd || session.cwd === options.cwd)
       .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
     return filtered.slice(0, options.limit ?? 50);

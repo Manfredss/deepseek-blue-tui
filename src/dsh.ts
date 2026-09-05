@@ -1,12 +1,16 @@
 import { spawn, spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 import { createConnection } from "node:net";
-import { accessSync, closeSync, constants, existsSync, openSync, readFileSync, statSync } from "node:fs";
+import { accessSync, closeSync, constants, existsSync, openSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { readFile, rename, unlink } from "node:fs/promises";
 import { basename, delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 import { isRecord, writeJsonAtomic, ensurePrivateDirectory } from "./fs-utils.js";
 
-const VERIFIED_DSH_VERSION = "0.1.0-rc.7";
+const DSH_PACKAGE_NAME = "@deepseek-ai/dsh";
+/** npm dist-tag installed by `dsh install` when no version is requested. */
+const DEFAULT_DSH_TAG = "latest";
+/** How far up from the executable to look for the package's own manifest. */
+const MANIFEST_SEARCH_DEPTH = 6;
 const LOG_MAX_BYTES = 1_048_576; // Rotate the DSH log at 1 MiB.
 const LOG_KEPT_ROTATIONS = 1;
 
@@ -64,9 +68,49 @@ function findOnPath(name: string, env: NodeJS.ProcessEnv): string | undefined {
   return undefined;
 }
 
+/** Reads a `version` from a manifest, but only if it really is dsh's own. */
+function dshManifestVersion(manifestPath: string): string | undefined {
+  try {
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as unknown;
+    if (!isRecord(manifest) || manifest.name !== DSH_PACKAGE_NAME) return undefined;
+    return typeof manifest.version === "string" && manifest.version ? manifest.version : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Version of the DSH that `commandPath` will actually run, discovered from the
+ * package's own manifest rather than from a pinned constant. Symlinks are
+ * resolved first, so a global shim (`/opt/homebrew/bin/dsh`), an npx cache
+ * copy and a `DEEPSEEK_DSH_COMMAND` path all report the truth.
+ */
+export function detectDshVersion(commandPath: string): string | undefined {
+  let current: string;
+  try {
+    current = dirname(realpathSync(commandPath));
+  } catch {
+    return undefined;
+  }
+  // A Windows global install leaves `dsh.cmd` beside node_modules rather than
+  // inside the package. Probe that sibling tree, but only for the directory
+  // the executable itself sits in: doing it at every level up would happily
+  // attribute an unrelated project's node_modules copy to this binary.
+  const sibling = dshManifestVersion(join(current, "node_modules", ...DSH_PACKAGE_NAME.split("/"), "package.json"));
+  if (sibling) return sibling;
+  for (let depth = 0; depth < MANIFEST_SEARCH_DEPTH; depth += 1) {
+    const own = dshManifestVersion(join(current, "package.json"));
+    if (own) return own;
+    const parent = dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+  return undefined;
+}
+
 function manifestCommand(requireFrom: NodeRequire): DshCommand | undefined {
   try {
-    const manifestPath = requireFrom.resolve("@deepseek-ai/dsh/package.json");
+    const manifestPath = requireFrom.resolve(`${DSH_PACKAGE_NAME}/package.json`);
     const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as unknown;
     if (!isRecord(manifest) || !isRecord(manifest.bin) || typeof manifest.bin.dsh !== "string") return undefined;
     const binPath = resolve(dirname(manifestPath), manifest.bin.dsh);
@@ -92,12 +136,16 @@ export function resolveDshCommand(options: {
   if (env.DEEPSEEK_DSH_COMMAND?.trim()) {
     const command = env.DEEPSEEK_DSH_COMMAND.trim();
     if (isAbsolute(command) && !executable(command)) return undefined;
-    return { command, argsPrefix: [], source: "custom", display: command };
+    const version = detectDshVersion(command);
+    return { command, argsPrefix: [], source: "custom", display: command, ...(version ? { version } : {}) };
   }
   const bundled = manifestCommand(options.requireFrom ?? createRequire(import.meta.url));
   if (bundled) return bundled;
   const fromPath = findOnPath("dsh", env);
-  if (fromPath) return { command: fromPath, argsPrefix: [], source: "path", display: fromPath };
+  if (fromPath) {
+    const version = detectDshVersion(fromPath);
+    return { command: fromPath, argsPrefix: [], source: "path", display: fromPath, ...(version ? { version } : {}) };
+  }
   return undefined;
 }
 
@@ -220,15 +268,16 @@ export interface InstallDshResult {
 }
 
 /**
- * Installs the pinned DSH version as an explicit global dependency. Since
- * v0.1, `@deepseek-ai/dsh` is no longer an optional dependency of this
- * package (it pulled in hundreds of packages); users opt in with
- * `deepseek dsh install` once.
+ * Installs DSH as an explicit global dependency. Since v0.1,
+ * `@deepseek-ai/dsh` is no longer an optional dependency of this package (it
+ * pulled in hundreds of packages); users opt in with `deepseek dsh install`
+ * once. Without an explicit `version` this tracks the `latest` dist-tag —
+ * there is no pinned "verified" version to fall behind any more.
  */
 export async function installDsh(options: InstallDshOptions = {}): Promise<InstallDshResult> {
   const env = options.env ?? process.env;
   const spawnImpl = options.spawnImpl ?? spawnSync;
-  const version = options.version ?? VERIFIED_DSH_VERSION;
+  const version = options.version ?? DEFAULT_DSH_TAG;
 
   const existing = resolveDshCommand({ env, ...(options.requireFrom ? { requireFrom: options.requireFrom } : {}) });
   if (existing) {
@@ -248,7 +297,7 @@ export async function installDsh(options: InstallDshOptions = {}): Promise<Insta
     shell,
   });
   const prefix = prefixResult.status === 0 ? prefixResult.stdout.trim() : "";
-  const spec = `@deepseek-ai/dsh@${version}`;
+  const spec = `${DSH_PACKAGE_NAME}@${version}`;
   const installResult = spawnImpl(
     npm,
     ["install", "--global", "--no-fund", "--no-audit", spec],
@@ -262,8 +311,20 @@ export async function installDsh(options: InstallDshOptions = {}): Promise<Insta
   if (binDirectory) {
     const candidate = join(binDirectory, binName);
     if (executable(candidate)) {
-      const command: DshCommand = { command: candidate, argsPrefix: [], source: "path", display: candidate, version };
-      return { installed: true, command, message: `已安装 DSH ${version}（${candidate}）` };
+      // Report what npm actually put on disk; `version` may just be a tag.
+      const resolved = detectDshVersion(candidate) ?? (version === DEFAULT_DSH_TAG ? undefined : version);
+      const command: DshCommand = {
+        command: candidate,
+        argsPrefix: [],
+        source: "path",
+        display: candidate,
+        ...(resolved ? { version: resolved } : {}),
+      };
+      return {
+        installed: true,
+        command,
+        message: resolved ? `已安装 DSH ${resolved}（${candidate}）` : `已安装 DSH（${candidate}）`,
+      };
     }
   }
   return {
@@ -290,6 +351,15 @@ export class DshManager {
     this.psImpl = psImpl;
   }
 
+  /**
+   * Version of the DSH currently installed on this machine, or undefined when
+   * none can be found. Read from the package manifest each time so it tracks
+   * upgrades without the client needing to know any version in advance.
+   */
+  installedVersion(env: NodeJS.ProcessEnv = process.env): string | undefined {
+    return resolveDshCommand({ env })?.version;
+  }
+
   async readState(): Promise<DshState | undefined> {
     try {
       return validState(JSON.parse(await readFile(this.statePath, "utf8")) as unknown);
@@ -314,9 +384,15 @@ export class DshManager {
       cwd: state.cwd,
       ...(state.dshVersion ? { version: state.dshVersion } : {}),
     };
-    const warning = state.dshVersion && state.dshVersion !== VERIFIED_DSH_VERSION
-      ? `当前 DSH ${state.dshVersion} 未经本版本验证（已验证 ${VERIFIED_DSH_VERSION}）`
-      : undefined;
+    // `state.dshVersion` is the version the running process was started from.
+    // Comparing it against what is installed *now* is a warning that can
+    // actually fire and can actually be acted on, unlike the old comparison
+    // against a hardcoded "verified" version that went stale on its own.
+    const installed = this.installedVersion();
+    const warning =
+      state.dshVersion && installed && state.dshVersion !== installed
+        ? `正在运行的 DSH ${state.dshVersion} 与当前安装的 ${installed} 不一致，可用 /dsh restart 切换`
+        : undefined;
     if (alive && open) return { phase: "running", ...common, ...(warning ? { warning } : {}) };
     if (alive) return { phase: "starting", ...common, ...(warning ? { warning } : {}) };
     if (open) {
@@ -339,7 +415,16 @@ export class DshManager {
 
     const command = options.command ?? resolveDshCommand();
     if (!command) {
-      throw new Error(`未找到 DSH。请运行 deepseek dsh install，或用 DEEPSEEK_DSH_COMMAND 指定已安装的 dsh`);
+      // Only a global install (or an explicit path) is discoverable: an
+      // `npx @deepseek-ai/dsh` copy lives inside npm's private cache, which
+      // is not on PATH, so having run npx before does not count as installed.
+      throw new Error(
+        "未找到 DSH。请任选一种方式安装：\n" +
+          "  · 在本终端内输入 /dsh install（命令行下为 deepseek dsh install）\n" +
+          "  · 自行全局安装：npm install -g @deepseek-ai/dsh\n" +
+          "  · 已有一份 dsh：用 DEEPSEEK_DSH_COMMAND=<dsh 可执行文件路径> 指向它\n" +
+          "注意：npx 装的副本只在 npm 缓存里，不在 PATH 上，因此不会被自动发现。",
+      );
     }
     await ensurePrivateDirectory(this.home);
     await rotateLogIfNeeded(this.logPath);

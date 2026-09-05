@@ -1,4 +1,4 @@
-import { userInfo } from "node:os";
+import { homedir, userInfo } from "node:os";
 import { join } from "node:path";
 import { appendFile, readFile, writeFile } from "node:fs/promises";
 import type { AppConfig, ChatMessage, ReasoningEffort, Session, TokenUsage } from "./types.js";
@@ -45,7 +45,7 @@ import { DshManager, formatDshStatus, installDsh } from "./dsh.js";
 import { LockHeldError } from "./fs-utils.js";
 import { renderContextHud, renderContextReport, renderPressureBar } from "./context-view.js";
 import { Spinner } from "./spinner.js";
-import { clipToWidth, padToWidth } from "./text-width.js";
+import { clipToWidth, padToWidth, shortenPath } from "./text-width.js";
 import { VERSION } from "./version.js";
 
 export interface TuiOptions {
@@ -134,6 +134,8 @@ export class DeepSeekTui {
   private readOnly = false;
   private mainPromptActive = false;
   private homeScreenPristine = true;
+  /** True while a slash command or a turn is running (no prompt is waiting). */
+  private commandBusy = false;
 
   constructor(options: TuiOptions) {
     this.configStore = options.configStore;
@@ -200,6 +202,7 @@ export class DeepSeekTui {
           columns: this.terminalColumns(),
           rows: this.terminalRows(),
           cwd: this.cwd,
+          home: homedir(),
           model: this.session.model,
           version: VERSION,
           apiKeyConfigured: Boolean(runtime.apiKey),
@@ -208,7 +211,7 @@ export class DeepSeekTui {
       );
     } else {
       this.line(this.theme.bold(`DeepSeek TUI v${VERSION}`));
-      this.line(this.theme.muted(`Unofficial community client · ${this.cwd}`));
+      this.line(this.theme.muted(clipToWidth(`Unofficial community client · ${shortenPath(this.cwd, Math.max(8, this.terminalColumns() - 32), homedir())}`, this.terminalColumns())));
     }
     if (this.session.messages.length > 0) this.renderHistory(this.session);
     const columns = this.terminalColumns();
@@ -261,6 +264,15 @@ export class DeepSeekTui {
       return;
     }
     if (!this.input?.isPrompting()) {
+      // A command is running (a DSH start can poll for 45s). Losing the whole
+      // terminal to one impatient Ctrl+C is harsh, so honour the same
+      // press-twice contract /help advertises for the prompt.
+      if (this.commandBusy && now - this.interruptArmedAt > INTERRUPT_EXIT_WINDOW_MS) {
+        this.interruptArmedAt = now;
+        // Clear the spinner's line first so the notice is not overpainted.
+        this.write(`\r\u001b[2K${this.theme.muted("命令执行中…再按一次 Ctrl+C 退出")}\n`);
+        return;
+      }
       this.quit();
       return;
     }
@@ -392,6 +404,7 @@ export class DeepSeekTui {
         if (!trimmed) continue;
         this.homeScreenPristine = false;
         const command = parseSlashCommand(line);
+        this.commandBusy = true;
         try {
           if (command) await this.handleCommand(command.name, command.args, command.tokens);
           else await this.sendMessage(unescapePrompt(line));
@@ -400,10 +413,13 @@ export class DeepSeekTui {
           // never take the whole REPL down with it.
           if ((error as Error).name === "AbortError") this.line(this.theme.yellow("已取消。"));
           else this.line(this.theme.red(`出错了：${this.errorMessage(error)}`));
+        } finally {
+          this.commandBusy = false;
         }
       }
     } finally {
       this.mainPromptActive = false;
+      this.commandBusy = false;
       if (this.session && this.session.messages.length > 0 && !this.readOnly) {
         await this.sessionStore.save(this.session);
       }
@@ -577,7 +593,14 @@ export class DeepSeekTui {
   }
 
   private async changeModel(requested: string): Promise<void> {
-    let model = requested.trim().split(/\s+/u)[0] ?? "";
+    const words = requested.trim().split(/\s+/u).filter(Boolean);
+    // Silently keeping only the first word turned `/model gpt 4` into a
+    // switch to a model literally named "gpt"; say so instead.
+    if (words.length > 1) {
+      this.line(this.theme.yellow("用法：/model [模型 ID]。模型 ID 不能包含空格。"));
+      return;
+    }
+    let model = words[0] ?? "";
     if (!model) {
       const result = await this.runMenu({
         title: "选择模型",
@@ -656,7 +679,9 @@ export class DeepSeekTui {
     const runtime = this.configStore.runtime(this.config);
     if (runtime.apiKey) {
       try {
-        const balance = await getBalance({ apiKey: runtime.apiKey, baseUrl: runtime.baseUrl });
+        const balance = await this.withSpinner("正在查询余额", () =>
+          getBalance({ apiKey: runtime.apiKey as string, baseUrl: runtime.baseUrl }),
+        );
         if (balance.balances.length === 0) this.line(this.theme.muted("余额接口未返回币种明细。"));
         for (const item of balance.balances) {
           this.line(
@@ -774,6 +799,7 @@ export class DeepSeekTui {
         : "· 暂无缓存数据";
     const contextPercent = percent === undefined ? "≈–%" : `≈${String(Math.round(percent))}%`;
     const fromEnvironment = Boolean(process.env.DEEPSEEK_API_KEY?.trim());
+    const columns = this.terminalColumns();
     const rows: readonly (readonly [string, string])[] = [
       ["模型", `${this.theme.bold(this.session.model)} ${this.theme.muted(`· ${runtime.baseUrl}`)}`],
       [
@@ -794,10 +820,9 @@ export class DeepSeekTui {
         `${this.session.id.slice(0, 8)} ${this.theme.muted(`· ${oneLine(this.session.title, 200)}`)}${this.readOnly ? this.theme.yellow(" · 只读") : ""}`,
       ],
       ["凭据", `${maskApiKey(runtime.apiKey)}${fromEnvironment ? this.theme.muted(" · 来自环境变量") : ""}`],
-      ["目录", this.cwd],
+      ["目录", shortenPath(this.cwd, Math.max(8, columns - 10), homedir())],
       ["DSH", formatDshStatus(dshStatus)],
     ];
-    const columns = this.terminalColumns();
     this.line(this.theme.bold("状态"));
     for (const [label, value] of rows) {
       this.line(clipToWidth(`  ${this.theme.muted(padToWidth(label, 6))}  ${value}`, columns));
@@ -820,6 +845,7 @@ export class DeepSeekTui {
         apiKeyConfigured: Boolean(runtime.apiKey),
         usage: this.session.usage,
         cwd: this.cwd,
+        home: homedir(),
       },
       { columns: this.terminalColumns() },
     );
@@ -831,7 +857,7 @@ export class DeepSeekTui {
     if (!lastTurnMs || lastCompletionTokens === undefined || lastCompletionTokens === 0) {
       return this.theme.muted("—（暂无最近一轮数据）");
     }
-    const tps = lastCompletionTokens / (lastTurnMs / 1_000);
+    const tps = lastCompletionTokens / DeepSeekTui.turnSeconds(lastTurnMs);
     const value = `${tps.toFixed(1)} tok/s（最近一轮）`;
     if (tps >= 50) return this.theme.green(value);
     if (tps >= 20) return this.theme.yellow(value);
@@ -856,6 +882,7 @@ export class DeepSeekTui {
           apiKeyConfigured: Boolean(runtime.apiKey),
           usage: this.session.usage,
           cwd: this.cwd,
+          home: homedir(),
         },
         { columns: this.terminalColumns() },
       ),
@@ -1089,16 +1116,27 @@ export class DeepSeekTui {
       return;
     }
     let chosenIndex: number | undefined;
-    const requested = token ? Number.parseInt(token, 10) : undefined;
-    if (requested !== undefined && Number.isInteger(requested) && requested >= 1 && requested <= indexes.length) {
+    if (token !== undefined) {
+      // `/rewind 3` must mean the same "3" the menu prints, so both number
+      // user messages from the start of the session, and an out-of-range
+      // number is reported instead of silently falling through to the menu.
+      const requested = Number.parseInt(token, 10);
+      if (!/^\d+$/u.test(token) || !Number.isInteger(requested) || requested < 1 || requested > indexes.length) {
+        this.line(this.theme.yellow(`用法：/rewind [1-${indexes.length}]，或不带参数从列表中选择。`));
+        return;
+      }
       chosenIndex = indexes[requested - 1];
     } else {
       const windowIndexes = indexes.slice(-12);
+      const offset = indexes.length - windowIndexes.length;
       const result = await this.runMenu({
-        title: "选择回退点（分支会话，原会话保留）",
+        title:
+          offset > 0
+            ? `选择回退点（分支会话，原会话保留）· 仅显示最近 ${windowIndexes.length} 条，更早的用 /rewind <编号>`
+            : "选择回退点（分支会话，原会话保留）",
         items: windowIndexes.map((index, position) => {
           const message = this.session?.messages[index];
-          return `${String(position + 1).padStart(2)}  ${oneLine(message?.content ?? "", 200)}`;
+          return `${String(offset + position + 1).padStart(2)}  ${oneLine(message?.content ?? "", 200)}`;
         }),
         footer: "↑/↓ 选择 · Enter 确认 · Esc 取消 · 数字跳转",
       });
@@ -1127,10 +1165,34 @@ export class DeepSeekTui {
       return;
     }
     const labels: Record<ChatMessage["role"], string> = { system: "系统", user: "用户", assistant: "助手" };
-    this.line(this.theme.bold(`会话内搜索「${query.trim()}」（${hits.length} 处匹配）`));
+    const needle = query.trim();
+    this.line(this.theme.bold(`会话内搜索「${needle}」（${hits.length} 处匹配）`));
+    const columns = this.terminalColumns();
     for (const hit of hits) {
-      this.line(`  ${this.theme.blue(`#${String(hit.index + 1).padStart(3)}`)} ${this.theme.muted(labels[hit.role].padEnd(2))} ${this.theme.muted(`L${String(hit.lineNumber).padStart(3)}`)}  ${hit.line}`);
+      const gutter = `  ${this.theme.blue(`#${String(hit.index + 1).padStart(3)}`)} ${this.theme.muted(labels[hit.role])} ${this.theme.muted(`L${String(hit.lineNumber).padStart(3)}`)}  `;
+      const body = this.highlight(safeTerminalText(hit.line), needle);
+      this.line(clipToWidth(`${gutter}${body}`, columns));
     }
+  }
+
+  /**
+   * Marks every occurrence of `needle` in already-sanitized text. Matching is
+   * case-insensitive on the same lowercasing `searchMessages` uses, so the
+   * highlight always lands on the substring that produced the hit.
+   */
+  private highlight(text: string, needle: string): string {
+    if (!needle) return text;
+    const haystack = text.toLocaleLowerCase();
+    const target = needle.toLocaleLowerCase();
+    // Lowercasing can change length (e.g. İ); fall back rather than misalign.
+    if (haystack.length !== text.length || target.length !== needle.length) return text;
+    let result = "";
+    let cursor = 0;
+    for (let at = haystack.indexOf(target); at >= 0; at = haystack.indexOf(target, cursor)) {
+      result += text.slice(cursor, at) + this.theme.bold(this.theme.brightBlue(text.slice(at, at + target.length)));
+      cursor = at + target.length;
+    }
+    return result + text.slice(cursor);
   }
 
   private async handleDsh(tokens: string[]): Promise<void> {
@@ -1145,26 +1207,32 @@ export class DeepSeekTui {
     }
     try {
       if (action === "install") {
+        // No spinner here: installDsh runs `npm install` synchronously with
+        // inherited stdio, so npm paints its own progress on this terminal
+        // and a spinner would both fail to animate and erase npm's last line.
+        this.line(this.theme.muted("正在通过 npm 全局安装 DSH，请稍候（npm 的输出会直接显示）…"));
         const result = await installDsh();
         this.line(result.message);
         return;
       }
       if (action === "status") {
-        this.line(formatDshStatus(await this.dsh.status(port)));
+        this.line(formatDshStatus(await this.withSpinner("正在查询 DSH 状态", () => this.dsh.status(port))));
         return;
       }
       if (action === "stop") {
-        this.line((await this.dsh.stop()).message);
+        this.line((await this.withSpinner("正在停止 DSH", () => this.dsh.stop())).message);
         return;
       }
       if (action === "logs") {
         const logs = await this.dsh.logs(80);
-        this.line(logs || this.theme.muted("暂无 DSH 日志。"));
+        this.line(logs ? safeTerminalText(logs) : this.theme.muted("暂无 DSH 日志。"));
         return;
       }
       if (action === "restart") {
-        await this.dsh.stop();
-        const status = await this.dsh.start({ port, cwd: this.cwd });
+        const status = await this.withSpinner("正在重启 DSH Web", async () => {
+          await this.dsh.stop();
+          return await this.dsh.start({ port, cwd: this.cwd });
+        });
         this.line(formatDshStatus(status));
         await this.openAndReport(status.url, "DSH Web");
         return;
@@ -1173,13 +1241,34 @@ export class DeepSeekTui {
         this.line(this.theme.yellow("用法：/dsh [install|start|open|status|stop|logs|restart] [端口]"));
         return;
       }
-      this.line(this.theme.muted("正在启动/连接 DSH Web…"));
-      const status = await this.dsh.start({ port, cwd: this.cwd });
+      const status = await this.withSpinner("正在启动/连接 DSH Web", () =>
+        this.dsh.start({ port, cwd: this.cwd }),
+      );
       this.line(formatDshStatus(status));
       if (status.phase === "running") await this.openAndReport(status.url, "DSH Web");
       else this.line(this.theme.muted(`仍在启动；日志位于 ${status.logFile ?? this.dsh.logPath}`));
     } catch (error) {
       this.line(this.theme.red(`DSH：${this.errorMessage(error)}`));
+    }
+  }
+
+  /**
+   * Runs a slow, non-streaming task behind the shared spinner. DSH start-up
+   * polls the port for up to 45 seconds; without this the prompt just sat
+   * there looking hung, with nothing to say the client was still working.
+   */
+  private async withSpinner<T>(label: string, task: () => Promise<T>): Promise<T> {
+    const spinner = new Spinner(this.output, (frame, elapsedMs) =>
+      clipToWidth(
+        `${this.theme.blue(frame)} ${this.theme.muted(`${label}… (${String(Math.max(0, Math.round(elapsedMs / 1_000)))}s)`)}`,
+        this.terminalColumns(),
+      ),
+    );
+    spinner.start();
+    try {
+      return await task();
+    } finally {
+      spinner.stop();
     }
   }
 
@@ -1224,9 +1313,18 @@ export class DeepSeekTui {
     );
   }
 
+  /**
+   * Throughput for one turn. Every readout goes through here — the turn
+   * footer and /status used to divide by differently-floored durations and
+   * quoted visibly different speeds for the same generation.
+   */
+  private static turnSeconds(elapsedMs: number): number {
+    return Math.max(0.1, elapsedMs / 1_000);
+  }
+
   /** Per-turn accounting line printed under a completed response. */
   private turnFooter(usage: TokenUsage, elapsedMs: number): string {
-    const seconds = Math.max(0.1, elapsedMs / 1_000);
+    const seconds = DeepSeekTui.turnSeconds(elapsedMs);
     const parts = [`${usage.promptTokens.toLocaleString()} in`, `${usage.completionTokens.toLocaleString()} out`];
     if (usage.reasoningTokens > 0) parts.push(`${usage.reasoningTokens.toLocaleString()} thinking`);
     if (usage.promptCacheHitTokens > 0) parts.push(`缓存 ${formatCompactTokens(usage.promptCacheHitTokens)}`);
@@ -1247,6 +1345,7 @@ export class DeepSeekTui {
       content: text,
       createdAt: new Date().toISOString(),
     };
+    const titleBefore = this.session.title;
     this.session.messages.push(userMessage);
     if (this.session.title === "New conversation") this.session.title = deriveTitle(text);
     await this.saveSession();
@@ -1308,10 +1407,13 @@ export class DeepSeekTui {
       if (result.reasoningContent) assistant.reasoningContent = result.reasoningContent;
       this.session.messages.push(assistant);
       this.session.usage = addUsage(this.session.usage, result.usage);
-      this.session.lastTurnMs = Math.max(1, Date.now() - startedAt);
+      // One measurement for both readouts: taking it twice made the turn
+      // footer and /status disagree by however long the session save took.
+      const elapsedMs = Math.max(1, Date.now() - startedAt);
+      this.session.lastTurnMs = elapsedMs;
       this.session.lastCompletionTokens = result.usage.completionTokens;
       await this.saveSession();
-      this.write(`\n\n${this.theme.muted(this.turnFooter(result.usage, Date.now() - startedAt))}\n\n`);
+      this.write(`\n\n${this.theme.muted(this.turnFooter(result.usage, elapsedMs))}\n\n`);
     } catch (error) {
       spinner.stop();
       // Keep a partial answer, but never store an assistant turn with empty
@@ -1321,6 +1423,15 @@ export class DeepSeekTui {
         if (reasoning) partial.reasoningContent = reasoning;
         this.session.messages.push(partial);
         await this.saveSession();
+      } else if (this.session.messages[this.session.messages.length - 1] === userMessage) {
+        // Nothing came back, so the prompt would otherwise be stranded as a
+        // trailing user turn — which both pollutes the transcript and leaves
+        // two user messages in a row on the next request. Drop it; the line
+        // is still in the input history, so ↑ brings it straight back.
+        this.session.messages.pop();
+        if (this.session.messages.length === 0) this.session.title = titleBefore;
+        await this.saveSession();
+        this.line(`\n${this.theme.muted("本轮未记录到会话（按 ↑ 可召回刚才的输入）。")}`);
       }
       if ((error as Error).name === "AbortError") this.line(`\n${this.theme.yellow("已中断本次生成。")}\n`);
       else this.line(`\n${this.theme.red(`请求失败：${this.errorMessage(error)}`)}\n`);

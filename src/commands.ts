@@ -232,8 +232,8 @@ const COMMAND_HELP_ROWS: readonly (readonly [string, string])[] = [
   ["/login [browser]", "安全录入 API Key，或打开 DeepSeek 平台"],
   ["/logout", "删除本地保存的 API Key"],
   ["/usage [topup]", "查询余额并打开用量或充值页面"],
-  ["/clear", "保存当前会话，清屏并开始一个空会话"],
-  ["/resume [ID/标题]", "浏览或恢复历史会话"],
+  ["/clear", "保存当前会话，清屏并开始一个空会话（别名 /new）"],
+  ["/resume [ID/标题]", "浏览或恢复历史会话（别名 /sessions）"],
   ["/rename <标题>", "重命名当前会话"],
   ["/thinking [on|off]", "显示或隐藏思考过程"],
   ["/effort [low|high|max]", "设置模型思考强度（默认 high）"],
@@ -246,9 +246,9 @@ const COMMAND_HELP_ROWS: readonly (readonly [string, string])[] = [
   ["/attach <路径>", "附加文本文件（≤256 KiB）并发送"],
   ["/rewind [编号]", "从更早的消息分支新会话（原会话保留）"],
   ["/search <关键词>", "在当前会话内全文搜索"],
-  ["/dsh [install|start|open|status|stop|logs|restart]", "管理官方 DSH Web"],
+  ["/dsh [子命令]", "管理官方 DSH Web：install/start/open/status/stop/logs/restart"],
   ["/help", "显示这份帮助"],
-  ["/exit", "保存并退出"],
+  ["/exit", "保存并退出（别名 /quit）"],
 ];
 
 const KEY_HELP_ROWS: readonly (readonly [string, string])[] = [

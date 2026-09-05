@@ -131,7 +131,7 @@ DSH 不再作为可选依赖随包安装（它会连带拉入数百个包）。�
 deepseek dsh install
 ```
 
-该命令安装已验证的 `@deepseek-ai/dsh@0.1.0-rc.7`；若检测到任何可用的 `dsh`（`DEEPSEEK_DSH_COMMAND`、`PATH` 或开发环境的本地安装）会直接复用而不重复安装。
+该命令安装 `@deepseek-ai/dsh` 的 `latest` 版本；若检测到任何可用的 `dsh`（`DEEPSEEK_DSH_COMMAND`、`PATH` 或开发环境的本地安装）会直接复用而不重复安装。需要特定版本时用 `npm install -g @deepseek-ai/dsh@<版本>` 自行安装，客户端会自动识别。
 
 <details>
 <summary><b>卸载</b></summary>
@@ -259,7 +259,7 @@ deepseek dsh status
 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 是 DeepSeek AI 官方开源的智能体框架。官方快速启动方式是持续运行 `npx @deepseek-ai/dsh web`；本项目把它包装成一个脱离当前终端的后台进程：
 
 ```bash
-# 首次使用：安装已验证的固定版本（检测到可用 dsh 时自动跳过）
+# 首次使用：安装 latest（检测到可用 dsh 时自动跳过）
 deepseek dsh install
 
 # 后台启动并打开浏览器（默认 127.0.0.1:3080）
@@ -290,7 +290,7 @@ deepseek dsh start --port 3090 --no-open
 - 端口被非本项目管理的进程占用时，`start` 会拒绝接管；`open` 可以只打开它
 - 日志超过 1 MiB 自动轮转（保留 `dsh.log.1`）；读取日志时对 `sk-` 密钥、Bearer Token 和 Authorization 头脱敏
 
-本项目已针对 [`@deepseek-ai/dsh@0.1.0-rc.7`](https://www.npmjs.com/package/@deepseek-ai/dsh) 验证。DSH 官方仍将其标记为 developer preview，未来可能有破坏性更新，因此这里固定版本并在检测到其他版本时提示。后台进程不是开机服务，重启系统后需重新启动。
+DSH 版本不再硬编码：客户端从实际安装的 [`@deepseek-ai/dsh`](https://www.npmjs.com/package/@deepseek-ai/dsh) 包清单里读取版本号（跟随符号链接，全局安装、npx 缓存副本与 `DEEPSEEK_DSH_COMMAND` 指定的路径都能识别），并在 `/dsh status` 中显示。若正在运行的 DSH 与当前安装的版本不一致（例如升级后旧进程还在跑），会提示用 `/dsh restart` 切换。DSH 官方仍将其标记为 developer preview，可能有破坏性更新；需要锁定版本时请自行 `npm install -g @deepseek-ai/dsh@<版本>`。后台进程不是开机服务，重启系统后需重新启动。
 
 </details>
 
