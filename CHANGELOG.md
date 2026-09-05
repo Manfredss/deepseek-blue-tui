@@ -4,6 +4,12 @@
 
 ## [未发布]
 
+## [0.2.0] - 2026-09-04
+
+### 内部
+
+- CLI 入口测试不再硬编码版本号（此前每次发版都会挂）；改为与 `package.json` 比对，断言的是「通过符号链接调用时仍能解析到自己的清单」这件事本身
+
 ### 新增
 
 - Claude Code 式 `Ctrl+C`：生成中中断本次生成；提示符下清空当前输入；输入已为空时 3 秒内再按一次才退出（并给出提示）。`Ctrl+D` 直接退出，`Ctrl+L` 清屏
@@ -112,3 +118,7 @@
 - 更友好的错误：无法连接时给出 Endpoint 与底层原因；余额查询 15 秒超时
 - 中性别名 `dstui` 与 `deepseek` 等价
 - macOS / Linux / Windows 的浏览器打开适配与 CI 矩阵（Node 22/24）
+
+[未发布]: https://github.com/Manfredss/deepseek-blue-tui/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/Manfredss/deepseek-blue-tui/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/Manfredss/deepseek-blue-tui/releases/tag/v0.1.0
