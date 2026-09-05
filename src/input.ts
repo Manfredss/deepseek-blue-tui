@@ -587,15 +587,27 @@ export class LineInput {
     return await new Promise<string | undefined>((resolve) => this.waiters.push(resolve));
   }
 
+  /**
+   * Hands the terminal to a foreign full-screen program (`/edit` spawns
+   * $EDITOR with inherited stdio). Bracketed paste is turned off for the
+   * duration: left on, an editor receives the raw `[200~` markers as
+   * keystrokes when the user pastes into it.
+   */
   pause(): void {
     this.interface.pause();
-    if (this.pasteInput) this.input.pause();
+    if (this.pasteInput) {
+      this.output.write(DISABLE_BRACKETED_PASTE);
+      this.input.pause();
+    }
   }
 
   resume(): void {
     if (!this.closed) {
       this.interface.resume();
-      if (this.pasteInput) this.input.resume();
+      if (this.pasteInput) {
+        this.output.write(ENABLE_BRACKETED_PASTE);
+        this.input.resume();
+      }
     }
   }
 
@@ -790,13 +802,42 @@ export class MenuPicker {
       return Number.isFinite(columns) && columns > 0 ? Math.max(16, Math.floor(columns) - 2) : 78;
     };
 
+    const rowBudget = (): number => {
+      const rows = (this.output as NodeJS.WriteStream).rows;
+      return Number.isFinite(rows) && rows > 0 ? Math.max(4, Math.floor(rows)) : 24;
+    };
+
     const render = (): void => {
+      const showCustom = Boolean(options.allowCustom && this.custom.length > 0);
+      // Chrome is title + optional custom line + optional footer. One extra
+      // row is reserved for the line the cursor sits on, so the repaint's
+      // cursor-up can never walk off the top of a short terminal — which
+      // used to shred the screen whenever the list was taller than it.
+      const chrome = 1 + (showCustom ? 1 : 0) + (options.footer ? 1 : 0);
+      const budget = Math.max(1, rowBudget() - chrome - 1);
+      const total = options.items.length;
+      let start = 0;
+      let capacity = total;
+      if (total > budget) {
+        capacity = Math.max(1, budget - 1); // One row goes to the overflow hint.
+        start = Math.max(0, Math.min(this.selected - Math.floor(capacity / 2), total - capacity));
+      }
+      const visible = options.items.slice(start, start + capacity);
       const lines: string[] = [color.accent(options.title)];
-      options.items.forEach((item, index) => {
+      visible.forEach((item, offset) => {
+        const index = start + offset;
         const clipped = clipToWidth(item, width());
         lines.push(index === this.selected ? color.accent(`❯ ${clipped}`) : `  ${color.muted(clipped)}`);
       });
-      if (options.allowCustom && this.custom.length > 0) {
+      const hiddenBefore = start;
+      const hiddenAfter = total - start - visible.length;
+      if (hiddenBefore > 0 || hiddenAfter > 0) {
+        const parts: string[] = [];
+        if (hiddenBefore > 0) parts.push(`↑ ${String(hiddenBefore)}`);
+        if (hiddenAfter > 0) parts.push(`↓ ${String(hiddenAfter)}`);
+        lines.push(color.muted(`  ${parts.join(" · ")} 项未显示`));
+      }
+      if (showCustom) {
         lines.push(`${color.accent(options.customLabel ?? "自定义：")} ${this.custom}▏`);
       }
       if (options.footer) lines.push(color.muted(options.footer));
@@ -888,6 +929,8 @@ export class MenuPicker {
         if (character === "\r" || character === "\n") {
           if (options.allowCustom && this.custom.trim().length > 0) {
             settle({ kind: "custom", text: this.custom.trim() });
+          } else if (options.items.length === 0) {
+            settle(undefined); // Custom-only picker with nothing typed yet.
           } else {
             settle({ kind: "index", index: this.selected });
           }

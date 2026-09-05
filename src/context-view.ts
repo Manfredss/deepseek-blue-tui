@@ -1,7 +1,7 @@
 import type { Theme } from "./theme.js";
 import type { TokenUsage } from "./types.js";
 import { formatCompactTokens } from "./session-tools.js";
-import { clipToWidth, padToWidth } from "./text-width.js";
+import { clipToWidth, padToWidth, shortenPath } from "./text-width.js";
 
 /**
  * Context HUD and report renderers (dsh-TUI 借鉴的上下文可观测性，适配行式 REPL)。
@@ -19,6 +19,9 @@ export interface ContextViewState {
   apiKeyConfigured: boolean;
   usage: TokenUsage;
   cwd: string;
+  /** Home directory, so long paths can render as `~/…`. Optional by design:
+   *  these views never read process state themselves. */
+  home?: string;
 }
 
 function safePercent(estimated: number, limit: number): number | undefined {
@@ -107,7 +110,7 @@ export function renderContextReport(theme: Theme, state: ContextViewState, optio
       "缓存",
       `命中 ${state.usage.promptCacheHitTokens.toLocaleString()} · 未命中 ${state.usage.promptCacheMissTokens.toLocaleString()}`,
     ),
-    row(theme, "工作目录", state.cwd),
+    row(theme, "工作目录", shortenPath(state.cwd, Math.max(8, columns - LABEL_WIDTH - 2), state.home)),
   ];
   if (percent === undefined) {
     lines.push(theme.yellow("注意：contextLimitTokens 无效，无法计算上下文占用比例"));

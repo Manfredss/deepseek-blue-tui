@@ -258,7 +258,8 @@ function fixtureSession(id: string, title: string, cwd: string, updatedAt: strin
     model: "deepseek-chat",
     createdAt: "2026-01-01T00:00:00.000Z",
     updatedAt,
-    messages: [],
+    // A conversation needs at least one message to be listable.
+    messages: [{ role: "user", content: title, createdAt: "2026-01-01T00:00:00.000Z" }],
     usage: { ...EMPTY_USAGE },
   };
 }
@@ -286,6 +287,13 @@ test("SessionStore saves, loads, lists, filters, limits, and finds sessions", as
   assert.deepEqual((await store.find("ALPHA", "/one")).map(({ id }) => id), ["alpha-001"]);
   assert.deepEqual((await store.find("second project", "/one")).map(({ id }) => id), ["beta-002"]);
   assert.deepEqual((await store.find("", "/two")).map(({ id }) => id), ["gamma-003"]);
+
+  // An empty conversation is nothing to resume, so it stays out of the list.
+  const blank = { ...fixtureSession("delta-004", "Blank", "/one", "2026-05-01T00:00:00.000Z"), messages: [] };
+  await writeFile(store.pathFor(blank.id), JSON.stringify(blank), "utf8");
+  assert.deepEqual((await store.list({ cwd: "/one" })).map(({ id }) => id), ["alpha-001", "beta-002"]);
+  assert.deepEqual(await store.find("delta-004", "/one"), []);
+  assert.ok(await store.load("delta-004"), "loading it by id still works");
 });
 
 test("SessionStore rejects traversal-like IDs", async (t) => {

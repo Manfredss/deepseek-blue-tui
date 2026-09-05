@@ -161,3 +161,53 @@ test("LineInput still resolves normally when nothing suspends it", async (t: Tes
   input.write("plain\r");
   assert.equal(await answer, "plain");
 });
+
+test("MenuPicker keeps a long list inside a short terminal and scrolls with the selection", async () => {
+  const input = new FakeInput();
+  const output = new FakeOutput();
+  output.rows = 8;
+  const chunks: string[] = [];
+  output.on("data", (chunk: Buffer) => chunks.push(chunk.toString("utf8")));
+  const items = Array.from({ length: 20 }, (_unused, index) => `\u9009\u9879 ${String(index + 1)}`);
+
+  const promise = new MenuPicker(input, output).run({ title: "\u957f\u5217\u8868", items, footer: "footer" });
+  await settle(20);
+
+  // Every repaint walks the cursor back up over its own rows; walking further
+  // than the terminal is tall would shred whatever is above the picker.
+  const cursorUps = (): number[] =>
+    [...chunks.join("").matchAll(/\u001b\[(\d+)A/gu)].map((match) => Number(match[1]));
+  assert.ok(Math.max(...cursorUps(), 0) < output.rows, "the picker must fit the terminal height");
+
+  assert.match(
+    chunks.join(""),
+    /\u2193 \d+ \u9879\u672a\u663e\u793a/u,
+    "an overflow hint says how much is off-screen",
+  );
+
+  for (let step = 0; step < 15; step += 1) {
+    input.write("\u001b[B");
+    await settle(4);
+  }
+  await settle(20);
+  assert.ok(Math.max(...cursorUps(), 0) < output.rows, "scrolling never grows the picker past the terminal");
+  const latest = chunks.join("");
+  assert.match(latest.slice(latest.lastIndexOf("\u957f\u5217\u8868")), /\u2191 \d+/u, "scrolled-past rows are counted too");
+
+  input.write("\r");
+  assert.deepEqual(await promise, { kind: "index", index: 15 }, "the selection tracks the highlighted row");
+});
+
+test("MenuPicker shows every item when the terminal has room", async () => {
+  const input = new FakeInput();
+  const output = new FakeOutput();
+  const chunks: string[] = [];
+  output.on("data", (chunk: Buffer) => chunks.push(chunk.toString("utf8")));
+  const promise = new MenuPicker(input, output).run({ title: "\u6807\u9898", items: ITEMS, footer: "footer" });
+  await settle(20);
+  const rendered = chunks.join("");
+  for (const item of ITEMS) assert.ok(rendered.includes(item), `${item} should be visible`);
+  assert.doesNotMatch(rendered, /\u9879\u672a\u663e\u793a/u, "no overflow hint when nothing overflows");
+  input.write("\r");
+  await promise;
+});

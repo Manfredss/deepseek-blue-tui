@@ -154,30 +154,37 @@ async function fetchWithAbort(
   });
 }
 
+/**
+ * What the user should do about a failing status. DeepSeek always returns its
+ * own English `error.message`, so the hint is appended to it rather than only
+ * used as a fallback — otherwise the actionable half is never seen.
+ */
+const STATUS_HINTS: Record<number, string> = {
+  400: "请求被拒绝；可用 /compact 压缩上下文，或用 /model 换一个模型",
+  401: "API Key 无效，请运行 /login 重新配置",
+  402: "账户余额不足，请运行 /usage 充值",
+  413: "请求体过大，请用 /compact 压缩上下文",
+  422: "模型参数无效，请检查 /model 与 /effort",
+  429: "请求过于频繁，请稍后重试",
+  500: "DeepSeek 服务暂时异常，请稍后重试",
+  503: "DeepSeek 服务繁忙，请稍后重试",
+};
+
 async function errorFromResponse(response: Response): Promise<DeepSeekApiError> {
   let message = "";
   let code: string | undefined;
   try {
     const value = JSON.parse(await response.text()) as unknown;
     if (isRecord(value) && isRecord(value.error)) {
-      if (typeof value.error.message === "string") message = value.error.message;
+      if (typeof value.error.message === "string") message = value.error.message.trim();
       if (typeof value.error.code === "string") code = value.error.code;
     }
   } catch {
     // Fall back to a safe status-based message below.
   }
-  if (!message) {
-    const descriptions: Record<number, string> = {
-      400: "请求格式无效",
-      401: "API Key 无效，请运行 /login 重新配置",
-      402: "账户余额不足，请运行 /usage 充值",
-      422: "模型参数无效",
-      429: "请求过于频繁，请稍后重试",
-      500: "DeepSeek 服务暂时异常",
-      503: "DeepSeek 服务繁忙，请稍后重试",
-    };
-    message = descriptions[response.status] ?? `DeepSeek API 请求失败 (${response.status})`;
-  }
+  const hint = STATUS_HINTS[response.status];
+  if (!message) message = hint ?? `DeepSeek API 请求失败 (${response.status})`;
+  else if (hint) message = `${message}（${hint}）`;
   return new DeepSeekApiError(message, response.status, code);
 }
 

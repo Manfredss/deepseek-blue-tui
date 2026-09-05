@@ -83,6 +83,37 @@ export function clipToWidth(value: string, width: number): string {
   return `${result}…${styled ? RESET : ""}`;
 }
 
+/**
+ * Shortens a filesystem path for a fixed display width. `home` collapses to
+ * `~`, and an over-long path keeps its **tail** (`…/project/src`) rather than
+ * its head: the trailing segments are what identify a working directory, so
+ * clipping them the way `clipToWidth` does throws away the useful half.
+ */
+export function shortenPath(value: string, width: number, home?: string): string {
+  const normalized = stripAnsi(value).replace(/[\r\n\t]/gu, " ").trim();
+  if (!normalized) return ".";
+  const root = home?.replace(/[\\/]+$/u, "");
+  const collapsed =
+    root && root.length > 1 && (normalized === root || /^[\\/]/u.test(normalized.slice(root.length)))
+      ? `~${normalized.slice(root.length)}`
+      : normalized;
+  if (width <= 0) return "";
+  if (visibleWidth(collapsed) <= width) return collapsed;
+  if (width === 1) return "…";
+  const characters = [...collapsed];
+  let used = 0;
+  let index = characters.length;
+  while (index > 0) {
+    const character = characters[index - 1] ?? "";
+    const codePoint = character.codePointAt(0) ?? 0;
+    const advance = isZeroWidth(character, codePoint) ? 0 : isWideCodePoint(codePoint) ? 2 : 1;
+    if (used + advance > width - 1) break;
+    used += advance;
+    index -= 1;
+  }
+  return `…${characters.slice(index).join("")}`;
+}
+
 export type Align = "left" | "center" | "right";
 
 /** Clips then pads a string to exactly `width` display cells. */

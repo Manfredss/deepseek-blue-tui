@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
@@ -17,6 +17,7 @@ import {
   dshChildEnvironment,
   dshExecutableName,
   formatDshStatus,
+  detectDshVersion,
   installDsh,
   isPortOpen,
   redactSecrets,
@@ -190,7 +191,9 @@ test("streamChat maps structured HTTP errors and safe fallback messages", async 
     }),
     (error: unknown) => {
       assert.ok(error instanceof DeepSeekApiError);
-      assert.equal(error.message, "bad credential");
+      // The server's own message is kept and the actionable hint appended,
+      // since DeepSeek always sends a message of its own.
+      assert.equal(error.message, "bad credential（API Key 无效，请运行 /login 重新配置）");
       assert.equal(error.status, 401);
       assert.equal(error.code, "invalid_api_key");
       return true;
@@ -535,13 +538,13 @@ test("installDsh installs the pinned version through npm when dsh is missing", a
   if (process.platform === "win32") {
     await writeFile(
       npmPath,
-      `@echo off\r\nif "%1"=="config" echo ${prefix}\r\nif "%1"=="install" echo ran > "${marker}"\r\n`,
+      `@echo off\r\nif "%1"=="config" echo ${prefix}\r\nif "%1"=="install" echo %* > "${marker}"\r\n`,
       "utf8",
     );
   } else {
     await writeFile(
       npmPath,
-      `#!/bin/sh\nif [ "$1" = "config" ]; then echo "${prefix}"; fi\nif [ "$1" = "install" ]; then echo ran > "${marker}"; fi\n`,
+      `#!/bin/sh\nif [ "$1" = "config" ]; then echo "${prefix}"; fi\nif [ "$1" = "install" ]; then echo "$@" > "${marker}"; fi\n`,
       "utf8",
     );
     await chmod(npmPath, 0o755);
@@ -558,5 +561,173 @@ test("installDsh installs the pinned version through npm when dsh is missing", a
   assert.equal(result.command.source, "path");
   assert.equal(result.command.command, dshTarget);
   assert.equal(result.command.version, "0.1.0-rc.7");
-  assert.equal((await readFile(marker, "utf8")).trim(), "ran");
+  assert.match(await readFile(marker, "utf8"), /@deepseek-ai\/dsh@0\.1\.0-rc\.7/);
+});
+
+// ---------------------------------------------------------------------------
+// DSH version discovery: the client no longer carries a hardcoded "verified"
+// version, so everything it reports must come from the install on disk.
+// ---------------------------------------------------------------------------
+
+/** Lays out a realistic `node_modules/@deepseek-ai/dsh` tree plus a bin shim. */
+async function fakeDshInstall(root: string, version: string): Promise<{ binJs: string; shim: string }> {
+  const pkg = join(root, "node_modules", "@deepseek-ai", "dsh");
+  await mkdir(join(pkg, "lib"), { recursive: true });
+  await writeFile(
+    join(pkg, "package.json"),
+    JSON.stringify({ name: "@deepseek-ai/dsh", version, bin: { dsh: "lib/bin.js" } }),
+    "utf8",
+  );
+  const binJs = join(pkg, "lib", "bin.js");
+  await writeFile(binJs, "#!/usr/bin/env node\n", "utf8");
+  await chmod(binJs, 0o755);
+  // npm links the package's bin into node_modules/.bin as a symlink.
+  const binDirectory = join(root, "node_modules", ".bin");
+  await mkdir(binDirectory, { recursive: true });
+  const shim = join(binDirectory, "dsh");
+  await symlink(binJs, shim);
+  return { binJs, shim };
+}
+
+test("detectDshVersion reads the version off the install, through symlinks", async (t) => {
+  const root = await temporaryDirectory(t, "deepseek-dsh-detect-");
+  const { binJs, shim } = await fakeDshInstall(root, "9.9.9-test.1");
+
+  assert.equal(detectDshVersion(binJs), "9.9.9-test.1", "direct path into the package");
+  assert.equal(detectDshVersion(shim), "9.9.9-test.1", "npm's .bin symlink resolves to the same package");
+
+  assert.equal(detectDshVersion(join(root, "nope")), undefined, "a missing path reports nothing");
+
+  // A binary that has nothing to do with dsh must not borrow a version from
+  // some unrelated package.json further up the tree.
+  const stranger = join(root, "stranger");
+  await mkdir(stranger, { recursive: true });
+  await writeFile(join(stranger, "package.json"), JSON.stringify({ name: "other", version: "1.2.3" }), "utf8");
+  const strangerBin = join(stranger, "tool");
+  await writeFile(strangerBin, "#!/bin/sh\n", "utf8");
+  await chmod(strangerBin, 0o755);
+  assert.equal(
+    detectDshVersion(strangerBin),
+    undefined,
+    "a dsh install elsewhere in the tree must not be attributed to this binary",
+  );
+});
+
+test("resolveDshCommand reports the installed version for PATH and custom commands", async (t) => {
+  const root = await temporaryDirectory(t, "deepseek-dsh-version-");
+  const { shim } = await fakeDshInstall(root, "0.2.0-rc.3");
+  const binDirectory = join(root, "node_modules", ".bin");
+
+  assert.deepEqual(resolveDshCommand({ env: { PATH: binDirectory }, requireFrom: rejectingRequire() }), {
+    command: shim,
+    argsPrefix: [],
+    source: "path",
+    display: shim,
+    version: "0.2.0-rc.3",
+  });
+
+  assert.deepEqual(resolveDshCommand({ env: { DEEPSEEK_DSH_COMMAND: shim }, requireFrom: rejectingRequire() }), {
+    command: shim,
+    argsPrefix: [],
+    source: "custom",
+    display: shim,
+    version: "0.2.0-rc.3",
+  });
+});
+
+test("installDsh tracks the latest dist-tag when no version is requested", async (t) => {
+  const directory = await temporaryDirectory(t, "deepseek-dsh-latest-");
+  const fakeNpmDirectory = join(directory, "npm-bin");
+  const prefix = join(directory, "prefix");
+  await mkdir(fakeNpmDirectory, { recursive: true });
+  const binDirectory = process.platform === "win32" ? prefix : join(prefix, "bin");
+  await mkdir(binDirectory, { recursive: true });
+  const dshTarget = join(binDirectory, process.platform === "win32" ? "dsh.cmd" : "dsh");
+  await writeFile(dshTarget, process.platform === "win32" ? "@echo off\r\n" : "#!/bin/sh\n", "utf8");
+  if (process.platform !== "win32") await chmod(dshTarget, 0o755);
+
+  const marker = join(directory, "npm-argv.txt");
+  const npmPath = join(fakeNpmDirectory, process.platform === "win32" ? "npm.cmd" : "npm");
+  if (process.platform === "win32") {
+    await writeFile(
+      npmPath,
+      `@echo off\r\nif "%1"=="config" echo ${prefix}\r\nif "%1"=="install" echo %* > "${marker}"\r\n`,
+      "utf8",
+    );
+  } else {
+    await writeFile(
+      npmPath,
+      `#!/bin/sh\nif [ "$1" = "config" ]; then echo "${prefix}"; fi\nif [ "$1" = "install" ]; then echo "$@" > "${marker}"; fi\n`,
+      "utf8",
+    );
+    await chmod(npmPath, 0o755);
+  }
+  const env = { ...process.env, PATH: fakeNpmDirectory };
+  delete env.DEEPSEEK_DSH_COMMAND;
+
+  const result = await installDsh({ env, requireFrom: rejectingRequire() });
+  assert.equal(result.installed, true);
+  assert.match(await readFile(marker, "utf8"), /@deepseek-ai\/dsh@latest/, "no stale pinned version");
+  // The fake install has no manifest, so there is no version to claim.
+  assert.equal(result.command?.version, undefined);
+  assert.doesNotMatch(result.message, /DSH latest/, "a dist-tag is not a version to report back");
+});
+
+test("DshManager.status warns only when the running DSH differs from the installed one", async (t) => {
+  const home = await temporaryDirectory(t, "deepseek-dsh-drift-");
+  const root = await temporaryDirectory(t, "deepseek-dsh-drift-pkg-");
+  const { shim } = await fakeDshInstall(root, "0.3.0");
+  const manager = new DshManager(home);
+
+  assert.equal(manager.installedVersion({ DEEPSEEK_DSH_COMMAND: shim }), "0.3.0");
+  assert.equal(manager.installedVersion({ PATH: "" }), undefined);
+
+  // Record a state file as if a DSH had been started from an older install.
+  const server = createServer();
+  await new Promise<void>((resolveListen, rejectListen) => {
+    server.once("error", rejectListen);
+    server.listen(0, "127.0.0.1", resolveListen);
+  });
+  t.after(() => new Promise<void>((done) => server.close(() => done())));
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  const port = address.port;
+
+  const statePath = join(home, "dsh", "state.json");
+  await mkdir(join(home, "dsh"), { recursive: true });
+  const writeState = async (dshVersion: string): Promise<void> => {
+    await writeFile(
+      statePath,
+      JSON.stringify({
+        version: 1,
+        pid: process.pid,
+        port,
+        url: `http://127.0.0.1:${port}`,
+        cwd: home,
+        logFile: join(home, "dsh", "dsh.log"),
+        startedAt: new Date().toISOString(),
+        launchDisplay: "fake dsh web",
+        dshVersion,
+      }),
+      "utf8",
+    );
+  };
+
+  const previous = process.env.DEEPSEEK_DSH_COMMAND;
+  process.env.DEEPSEEK_DSH_COMMAND = shim;
+  t.after(() => {
+    if (previous === undefined) delete process.env.DEEPSEEK_DSH_COMMAND;
+    else process.env.DEEPSEEK_DSH_COMMAND = previous;
+  });
+
+  await writeState("0.3.0");
+  const matching = await manager.status(port);
+  assert.equal(matching.phase, "running");
+  assert.equal(matching.version, "0.3.0");
+  assert.equal(matching.warning, undefined, "same version as installed is not worth a warning");
+
+  await writeState("0.2.0");
+  const drifted = await manager.status(port);
+  assert.match(drifted.warning ?? "", /正在运行的 DSH 0\.2\.0 与当前安装的 0\.3\.0 不一致/);
+  assert.match(drifted.warning ?? "", /\/dsh restart/, "the warning says how to fix it");
 });
