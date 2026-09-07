@@ -371,12 +371,23 @@ export class DshManager {
   }
 
   /**
+   * The DSH this manager would launch, or undefined when none is installed.
+   *
+   * Callers go through here rather than the module function so that whatever
+   * DSH a manager represents stays substitutable — a caller reaching around it
+   * would behave differently depending on what happens to be on the machine.
+   */
+  resolveCommand(env: NodeJS.ProcessEnv = process.env): DshCommand | undefined {
+    return resolveDshCommand({ env });
+  }
+
+  /**
    * Version of the DSH currently installed on this machine, or undefined when
    * none can be found. Read from the package manifest each time so it tracks
    * upgrades without the client needing to know any version in advance.
    */
   installedVersion(env: NodeJS.ProcessEnv = process.env): string | undefined {
-    return resolveDshCommand({ env })?.version;
+    return this.resolveCommand(env)?.version;
   }
 
   async readState(): Promise<DshState | undefined> {
@@ -506,7 +517,7 @@ export class DshManager {
   }): Promise<HeadlessResult> {
     const task = options.task.trim();
     if (!task) throw new Error("任务内容不能为空");
-    const command = options.command ?? resolveDshCommand();
+    const command = options.command ?? this.resolveCommand();
     if (!command) throw new Error(DSH_MISSING_MESSAGE);
 
     const child = spawn(

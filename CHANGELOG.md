@@ -27,6 +27,7 @@
 
 - **菜单与生成守卫嵌套会让后续命令执行两次**：`/race` 会在生成守卫仍持有终端时打开选择菜单，两者各自 suspend/resume 一次行编辑器，导致同一个输入流上残留两个 readline 实例——第二个把每一行都排进 type-ahead 队列，于是下一条命令被重放。`suspendForMenu`/`resumeFromMenu` 改为按嵌套深度配对，生成守卫的 `detach()` 改为幂等，`/race` 也会在打开菜单前先交还终端
 - 低于 $0.0001 的花费此前显示成 `$0.0000`，读起来像免费；现在显示 `<$0.0001`
+- `/do` 绕过注入的 `DshManager` 直接调用模块级的 `resolveDshCommand()`，行为随「本机是否恰好装了 dsh」而变（本地通过、CI 全挂）。DSH 查找收进 `DshManager.resolveCommand()`，与其余调用一致且可替换
 
 ## [0.2.0] - 2026-09-04
 

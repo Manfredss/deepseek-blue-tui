@@ -41,7 +41,7 @@ import { renderWelcomeScreen } from "./logo.js";
 import { LineInput, promptSecret, MenuPicker, watchAbortKeys, type MenuPickerOptions, type MenuPickerResult } from "./input.js";
 import { DeepSeekApiError, getBalance, streamChat } from "./api.js";
 import { DEEPSEEK_URLS, openUrl } from "./open-url.js";
-import { DshManager, formatDshStatus, installDsh, resolveDshCommand } from "./dsh.js";
+import { DshManager, formatDshStatus, installDsh } from "./dsh.js";
 import { LockHeldError } from "./fs-utils.js";
 import { renderContextHud, renderContextReport, renderPressureBar } from "./context-view.js";
 import { Spinner } from "./spinner.js";
@@ -1500,7 +1500,7 @@ export class DeepSeekTui {
       this.line(this.theme.yellow("用法：/do <任务>。把任务交给 DSH 执行（会真实修改文件、运行命令）。"));
       return;
     }
-    const command = resolveDshCommand();
+    const command = this.dsh.resolveCommand();
     if (!command) {
       this.line(this.theme.red(`DSH：${DSH_NOT_FOUND_HINT}`));
       return;

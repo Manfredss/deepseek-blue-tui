@@ -7,7 +7,7 @@ import { PassThrough } from "node:stream";
 import test, { type TestContext } from "node:test";
 
 import { ConfigStore } from "../src/config.js";
-import { DshManager, type DshStatus, type HeadlessResult } from "../src/dsh.js";
+import { DshManager, type DshCommand, type DshStatus, type HeadlessResult } from "../src/dsh.js";
 import { createSession, SessionStore } from "../src/session-store.js";
 import { LineInput } from "../src/input.js";
 import { DeepSeekTui } from "../src/tui.js";
@@ -570,10 +570,23 @@ test("/race needs at least two efforts and a question", async (t: TestContext) =
   await app.finish();
 });
 
-/** A DSH stub whose headless run is fully controlled by the test. */
+/**
+ * A DSH stub whose availability and headless run are fully controlled by the
+ * test. Both must be stubbed: reaching the real lookup would make these tests
+ * pass or fail according to whether the machine happens to have dsh installed.
+ */
 class StubDsh extends DshManager {
-  constructor(home: string, private readonly reply: HeadlessResult) {
+  constructor(
+    home: string,
+    private readonly reply: HeadlessResult,
+    private readonly available = true,
+  ) {
     super(home);
+  }
+
+  override resolveCommand(): DshCommand | undefined {
+    if (!this.available) return undefined;
+    return { command: "/stub/dsh", argsPrefix: [], source: "path", display: "/stub/dsh", version: "9.9.9-stub" };
   }
 
   override async runHeadless(options: { task: string; onData?: (chunk: string) => void }): Promise<HeadlessResult> {
@@ -625,7 +638,7 @@ test("/do confirms first, then folds the agent's result into the conversation", 
   assert.match(saved?.messages[3]?.content ?? "", /^\[DSH 执行结果\]/u, "provenance is explicit");
 });
 
-test("/do declines cleanly and reports a missing DSH", async (t: TestContext) => {
+test("/do declines cleanly without running the agent", async (t: TestContext) => {
   const home = await mkdtemp(join(tmpdir(), "deepseek-do-no-"));
   t.after(() => rm(home, { recursive: true, force: true }));
   const dsh = new StubDsh(home, { output: "不该跑到这里", status: 0, timedOut: false });
@@ -641,6 +654,20 @@ test("/do declines cleanly and reports a missing DSH", async (t: TestContext) =>
   await settle(250);
   assert.match(app.plain(), /已取消/);
   assert.doesNotMatch(app.plain(), /不该跑到这里/, "declining must not run the agent");
+  await app.finish();
+});
+
+test("/do reports a missing DSH instead of prompting", async (t: TestContext) => {
+  const home = await mkdtemp(join(tmpdir(), "deepseek-do-missing-"));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const dsh = new StubDsh(home, { output: "不该跑到这里", status: 0, timedOut: false }, false);
+  const app = await harness(t, { dsh });
+  await app.start();
+
+  const missing = await app.send("/do 修一下", 250);
+  assert.match(missing, /未找到 DSH/);
+  assert.match(missing, /\/dsh install/, "the message says how to fix it");
+  assert.doesNotMatch(missing, /确认执行/, "there is nothing to confirm without a DSH");
   await app.finish();
 });
 
