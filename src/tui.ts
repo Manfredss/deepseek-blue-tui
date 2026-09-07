@@ -2,7 +2,7 @@ import { homedir, userInfo } from "node:os";
 import { join } from "node:path";
 import { appendFile, readFile, writeFile } from "node:fs/promises";
 import type { AppConfig, ChatMessage, ReasoningEffort, Session, TokenUsage } from "./types.js";
-import { REASONING_EFFORT_LABELS, REASONING_EFFORTS, RECOMMENDED_MODELS } from "./types.js";
+import { EMPTY_USAGE, REASONING_EFFORT_LABELS, REASONING_EFFORTS, RECOMMENDED_MODELS } from "./types.js";
 import { ConfigStore, maskApiKey } from "./config.js";
 import {
   addUsage,
@@ -41,10 +41,12 @@ import { renderWelcomeScreen } from "./logo.js";
 import { LineInput, promptSecret, MenuPicker, watchAbortKeys, type MenuPickerOptions, type MenuPickerResult } from "./input.js";
 import { DeepSeekApiError, getBalance, streamChat } from "./api.js";
 import { DEEPSEEK_URLS, openUrl } from "./open-url.js";
-import { DshManager, formatDshStatus, installDsh } from "./dsh.js";
+import { DshManager, formatDshStatus, installDsh, resolveDshCommand } from "./dsh.js";
 import { LockHeldError } from "./fs-utils.js";
 import { renderContextHud, renderContextReport, renderPressureBar } from "./context-view.js";
 import { Spinner } from "./spinner.js";
+import { MarkdownStream, renderMarkdown } from "./markdown.js";
+import { cacheReport, estimateCost, formatCost, prefixLoss, pricingFor, type ModelPricing } from "./pricing.js";
 import { clipToWidth, padToWidth, shortenPath } from "./text-width.js";
 import { VERSION } from "./version.js";
 
@@ -66,6 +68,9 @@ export interface TuiOptions {
 const HISTORY_LIMIT = 500;
 /** Window in which a second Ctrl+C at an empty prompt means "quit". */
 const INTERRUPT_EXIT_WINDOW_MS = 3_000;
+/** Shown when /do cannot find a DSH to delegate to. */
+const DSH_NOT_FOUND_HINT =
+  "未找到 DSH，无法执行任务。输入 /dsh install 安装，或用 DEEPSEEK_DSH_COMMAND 指向已有的 dsh。";
 
 function safeTerminalText(value: string): string {
   return value.replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g, "");
@@ -450,7 +455,7 @@ export class DeepSeekTui {
       if (message.reasoningContent && this.config.showReasoning) {
         this.line(this.theme.muted(shortText(message.reasoningContent, 500)));
       }
-      this.line(shortText(message.content));
+      this.line(renderMarkdown(shortText(message.content), this.theme));
     }
     this.line();
   }
@@ -477,8 +482,13 @@ export class DeepSeekTui {
   private beginGenerationGuard(): { detach: () => void } {
     this.input.suspendForMenu();
     const watcher = watchAbortKeys(this.inputStream, () => this.controller?.abort());
+    let detached = false;
     return {
       detach: () => {
+        // Callers detach early (before opening a picker) and again in their
+        // finally; resuming twice would rebuild the line editor twice.
+        if (detached) return;
+        detached = true;
         const leftover = watcher.detach();
         this.input.resumeFromMenu();
         if (leftover) this.input.pushText(leftover);
@@ -549,8 +559,14 @@ export class DeepSeekTui {
       case "context":
         await this.showContext();
         break;
+      case "cache":
+        this.showCache();
+        break;
       case "btw":
         await this.sideQuestion(args);
+        break;
+      case "race":
+        await this.raceEfforts(args);
         break;
       case "compact":
         await this.compactConversation();
@@ -572,6 +588,10 @@ export class DeepSeekTui {
         break;
       case "dsh":
         await this.handleDsh(tokens);
+        break;
+      case "do":
+      case "agent":
+        await this.delegateToAgent(args);
         break;
       default:
         this.reportUnknownCommand(name);
@@ -625,6 +645,8 @@ export class DeepSeekTui {
       this.line(this.theme.yellow("模型名称无效。只允许字母、数字以及 . _ : / -"));
       return;
     }
+    // A different model has a different cache, so the prefix is lost too.
+    if (this.session && model !== this.session.model && !(await this.confirmPrefixLoss("切换模型"))) return;
     this.config.model = model;
     if (this.session) {
       this.session.model = model;
@@ -939,6 +961,7 @@ export class DeepSeekTui {
     let reasoning = "";
     let reasoningShown = false;
     let contentShown = false;
+    const markdown = new MarkdownStream({ theme: this.theme });
     const spinner = new Spinner(this.output, (frame, elapsedMs) =>
       this.generationStatus(frame, elapsedMs, reasoning, "侧问中"),
     );
@@ -970,16 +993,18 @@ export class DeepSeekTui {
             if (reasoningShown) this.write("\n");
             contentShown = true;
           }
-          this.write(safeTerminalText(delta));
+          this.write(markdown.write(delta));
         },
       });
       spinner.stop();
+      this.write(markdown.end());
       if (!contentShown && !reasoningShown) this.write(this.theme.muted("(没有文本响应)"));
       this.write(
         `\n\n${this.theme.muted(`侧问结束 · ${result.usage.totalTokens.toLocaleString()} tokens（不计入会话）`)}\n\n`,
       );
     } catch (error) {
       spinner.stop();
+      this.write(markdown.end());
       if ((error as Error).name === "AbortError") this.line(`\n${this.theme.yellow("已中断侧问。")}\n`);
       else this.line(`\n${this.theme.red(`侧问失败：${this.errorMessage(error)}`)}\n`);
     } finally {
@@ -987,6 +1012,191 @@ export class DeepSeekTui {
       generationGuard.detach();
       this.controller = undefined;
     }
+  }
+
+  /**
+   * /race — ask the same question at several thinking efforts at once, then
+   * keep one answer.
+   *
+   * DeepSeek V4's effort knob has no published guidance on when `max` earns
+   * its latency, and this client already measures tokens, time and cost
+   * exactly — so the honest way to answer "is it worth it *for my questions*"
+   * is to run them side by side and look at the numbers.
+   */
+  private async raceEfforts(args: string): Promise<void> {
+    if (!this.session) return;
+    const tokens = args.trim().split(/\s+/u).filter(Boolean).map((value) => value.toLocaleLowerCase());
+    const efforts = tokens.filter((token): token is ReasoningEffort =>
+      (REASONING_EFFORTS as readonly string[]).includes(token),
+    );
+    const prompt = tokens.filter((token) => !(REASONING_EFFORTS as readonly string[]).includes(token)).join(" ");
+    const levels = efforts.length >= 2 ? [...new Set(efforts)] : [...REASONING_EFFORTS];
+    if (efforts.length === 1) {
+      this.line(this.theme.yellow("至少要两个档位才能对比，例如 /race low max 你的问题"));
+      return;
+    }
+    // The question can also just be the last thing already asked.
+    const question = prompt.trim() || this.lastUserMessage();
+    if (!question) {
+      this.line(this.theme.yellow("用法：/race [low high max] <问题>。不带问题时复用上一条用户消息。"));
+      return;
+    }
+    const runtime = this.configStore.runtime(this.config);
+    if (!runtime.apiKey) {
+      this.line(this.theme.yellow("缺少 API Key。请先输入 /login，或设置 DEEPSEEK_API_KEY。"));
+      return;
+    }
+
+    const request = this.requestMessages([
+      ...this.session.messages,
+      { role: "user", content: question, createdAt: new Date().toISOString() },
+    ]);
+    this.line(this.theme.bold(`并行对比 ${levels.join(" / ")}`));
+    this.line(this.theme.muted(`  ${oneLine(question, 200)}`));
+
+    const controller = new AbortController();
+    this.controller = controller;
+    const generationGuard = this.beginGenerationGuard();
+    const done = new Set<ReasoningEffort>();
+    const spinner = new Spinner(this.output, (frame, elapsedMs) =>
+      clipToWidth(
+        `${this.theme.blue(frame)} ${this.theme.muted(`并行生成中… (${String(Math.max(0, Math.round(elapsedMs / 1_000)))}s · 已完成 ${done.size}/${levels.length} · esc 中断)`)}`,
+        this.terminalColumns(),
+      ),
+    );
+    this.write("\n");
+    spinner.start();
+    const pricing = this.pricing();
+
+    interface RaceEntry {
+      effort: ReasoningEffort;
+      content: string;
+      reasoning: string;
+      usage: TokenUsage;
+      elapsedMs: number;
+      error?: string;
+    }
+
+    try {
+      const results = await Promise.all(
+        levels.map(async (effort): Promise<RaceEntry> => {
+          const startedAt = Date.now();
+          try {
+            const result = await streamChat({
+              apiKey: runtime.apiKey as string,
+              baseUrl: runtime.baseUrl,
+              model: this.session?.model ?? this.config.model,
+              messages: request,
+              effort,
+              signal: controller.signal,
+            });
+            done.add(effort);
+            spinner.refresh();
+            return {
+              effort,
+              content: result.content,
+              reasoning: result.reasoningContent,
+              usage: result.usage,
+              elapsedMs: Math.max(1, Date.now() - startedAt),
+            };
+          } catch (error) {
+            done.add(effort);
+            spinner.refresh();
+            return {
+              effort,
+              content: "",
+              reasoning: "",
+              usage: { ...EMPTY_USAGE },
+              elapsedMs: Math.max(1, Date.now() - startedAt),
+              error: this.errorMessage(error),
+            };
+          }
+        }),
+      );
+      spinner.stop();
+      // Generation is over, so hand the terminal back before the picker opens:
+      // the abort watcher would otherwise race the picker for the same keys and
+      // replay them as type-ahead afterwards.
+      generationGuard.detach();
+      this.controller = undefined;
+
+      const columns = this.terminalColumns();
+      this.line(this.theme.bold("对比"));
+      this.line(
+        this.theme.muted(
+          `  ${padToWidth("档位", 6)}${padToWidth("耗时", 9)}${padToWidth("输出", 8)}${padToWidth("思考", 8)}${pricing ? padToWidth("花费", 10) : ""}摘要`,
+        ),
+      );
+      for (const entry of results) {
+        if (entry.error) {
+          this.line(`  ${this.theme.bold(padToWidth(entry.effort, 6))}${this.theme.red(`失败：${entry.error}`)}`);
+          continue;
+        }
+        const cost = pricing ? padToWidth(`≈${formatCost(estimateCost(entry.usage, pricing))}`, 10) : "";
+        this.line(
+          clipToWidth(
+            `  ${this.theme.bold(padToWidth(entry.effort, 6))}${padToWidth(`${(entry.elapsedMs / 1_000).toFixed(1)}s`, 9)}${padToWidth(formatCompactTokens(entry.usage.completionTokens), 8)}${padToWidth(formatCompactTokens(entry.usage.reasoningTokens), 8)}${cost}${this.theme.muted(oneLine(entry.content, 200))}`,
+            columns,
+          ),
+        );
+      }
+
+      const usable = results.filter((entry) => !entry.error && entry.content.trim());
+      if (usable.length === 0) {
+        this.line(this.theme.yellow("没有可用的回答，会话未改变。"));
+        return;
+      }
+      this.line();
+      const choice = await this.runMenu({
+        title: "查看并保留哪一个？（其余丢弃，不写入会话）",
+        items: usable.map(
+          (entry) =>
+            `${entry.effort.padEnd(5)} ${(entry.elapsedMs / 1_000).toFixed(1)}s  ${oneLine(entry.content, 160)}`,
+        ),
+        footer: "↑/↓ 选择 · Enter 保留 · Esc 全部丢弃 · 数字跳转",
+      });
+      if (!choice || choice.kind !== "index") {
+        this.line(this.theme.muted("已全部丢弃，会话未改变。"));
+        return;
+      }
+      const kept = usable[choice.index];
+      if (!kept) return;
+
+      this.write(`\n${this.theme.blue(`◆ DeepSeek (${kept.effort})`)}\n`);
+      this.line(renderMarkdown(kept.content, this.theme));
+
+      const now = new Date().toISOString();
+      this.session.messages.push({ role: "user", content: question, createdAt: now });
+      const assistant: ChatMessage = { role: "assistant", content: kept.content, createdAt: new Date().toISOString() };
+      if (kept.reasoning) assistant.reasoningContent = kept.reasoning;
+      this.session.messages.push(assistant);
+      // Every branch was billed, so charge the session for all of them.
+      for (const entry of results) this.session.usage = addUsage(this.session.usage, entry.usage);
+      this.session.lastTurnMs = kept.elapsedMs;
+      this.session.lastCompletionTokens = kept.usage.completionTokens;
+      if (this.session.title === "New conversation") this.session.title = deriveTitle(question);
+      await this.saveSession();
+      this.write(`\n${this.theme.muted(`已保留 ${kept.effort} 的回答 · ${this.turnFooter(kept.usage, kept.elapsedMs)}`)}\n`);
+      this.line(this.theme.muted(`（其余 ${results.length - 1} 个分支同样计费，已计入会话累计）`));
+      this.line();
+    } catch (error) {
+      spinner.stop();
+      if ((error as Error).name === "AbortError") this.line(`\n${this.theme.yellow("已中断对比。")}\n`);
+      else this.line(`\n${this.theme.red(`对比失败：${this.errorMessage(error)}`)}\n`);
+    } finally {
+      spinner.stop();
+      generationGuard.detach();
+      this.controller = undefined;
+    }
+  }
+
+  private lastUserMessage(): string {
+    if (!this.session) return "";
+    for (let index = this.session.messages.length - 1; index >= 0; index -= 1) {
+      const message = this.session.messages[index];
+      if (message?.role === "user") return message.content;
+    }
+    return "";
   }
 
   /** /compact — summarize history into one system message, with auto backup. */
@@ -1006,6 +1216,7 @@ export class DeepSeekTui {
       this.line(this.theme.yellow("缺少 API Key。请先输入 /login，或设置 DEEPSEEK_API_KEY。"));
       return;
     }
+    if (!(await this.confirmPrefixLoss("压缩"))) return;
     const answer = await this.input.next(this.theme.brightBlue("确认压缩？压缩前会自动导出备份 [y/N] › "), {
       history: false,
     });
@@ -1272,6 +1483,130 @@ export class DeepSeekTui {
     }
   }
 
+  /**
+   * /do — hand a task to `dsh --profile headless` and fold the result back
+   * into this conversation.
+   *
+   * The point is the split: the REPL is a cheap place to think a problem
+   * through, DSH is where files actually get edited and commands actually get
+   * run. Recent turns are passed along as context so the agent does not start
+   * from nothing, and the outcome is recorded so the chat can keep going
+   * informed by what happened.
+   */
+  private async delegateToAgent(task: string): Promise<void> {
+    if (!this.session) return;
+    const text = task.trim();
+    if (!text) {
+      this.line(this.theme.yellow("用法：/do <任务>。把任务交给 DSH 执行（会真实修改文件、运行命令）。"));
+      return;
+    }
+    const command = resolveDshCommand();
+    if (!command) {
+      this.line(this.theme.red(`DSH：${DSH_NOT_FOUND_HINT}`));
+      return;
+    }
+
+    const context = this.recentContext();
+    this.line(this.theme.bold("交给 DSH 执行"));
+    this.line(`  ${this.theme.muted(padToWidth("任务", 6))}  ${oneLine(text, 400)}`);
+    this.line(`  ${this.theme.muted(padToWidth("目录", 6))}  ${shortenPath(this.cwd, Math.max(8, this.terminalColumns() - 12), homedir())}`);
+    this.line(`  ${this.theme.muted(padToWidth("DSH", 6))}  ${command.display}${command.version ? this.theme.muted(` (v${command.version})`) : ""}`);
+    if (context) this.line(`  ${this.theme.muted(padToWidth("上下文", 6))}  ${this.theme.muted(`附带最近 ${formatCompactTokens(estimateTextTokens(context))} tokens 的对话摘要`)}`);
+    this.line(this.theme.yellow("DSH 会在上述目录里真实修改文件、执行命令，且使用它自己的凭据。"));
+
+    const answer = await this.input.next(this.theme.brightBlue("确认执行？[y/N] › "), { history: false });
+    if (answer?.trim().toLocaleLowerCase() !== "y") {
+      this.line(this.theme.muted("已取消。"));
+      return;
+    }
+
+    const prompt = context ? `${context}\n\n---\n\n${text}` : text;
+    this.controller = new AbortController();
+    const generationGuard = this.beginGenerationGuard();
+    let bytes = 0;
+    const spinner = new Spinner(this.output, (frame, elapsedMs) =>
+      clipToWidth(
+        `${this.theme.blue(frame)} ${this.theme.muted(`DSH 执行中… (${String(Math.max(0, Math.round(elapsedMs / 1_000)))}s · ${formatCompactTokens(bytes / 4)} 输出 · esc 中断)`)}`,
+        this.terminalColumns(),
+      ),
+    );
+    this.write("\n");
+    spinner.start();
+    const startedAt = Date.now();
+    try {
+      const result = await this.dsh.runHeadless({
+        task: prompt,
+        cwd: this.cwd,
+        signal: this.controller.signal,
+        onData: (chunk) => {
+          bytes += chunk.length;
+          spinner.refresh();
+        },
+      });
+      spinner.stop();
+      const seconds = Math.max(0.1, (Date.now() - startedAt) / 1_000);
+      if (this.controller.signal.aborted) {
+        this.line(`${this.theme.yellow("已中断 DSH 执行。")}\n`);
+        return;
+      }
+      if (result.timedOut) {
+        this.line(`${this.theme.red("DSH 执行超时，已终止。")}\n`);
+        return;
+      }
+      if (!result.output) {
+        this.line(this.theme.yellow(`DSH 没有输出${result.status === 0 ? "" : `（退出码 ${String(result.status)}）`}。`));
+        if (result.stderr) this.line(this.theme.muted(safeTerminalText(result.stderr).slice(0, 2_000)));
+        return;
+      }
+
+      this.write(`${this.theme.blue("◆ DSH")}\n`);
+      this.line(renderMarkdown(result.output, this.theme));
+      if (result.status !== 0) {
+        this.line(this.theme.yellow(`（DSH 退出码 ${String(result.status)}）`));
+        if (result.stderr) this.line(this.theme.muted(safeTerminalText(result.stderr).slice(0, 2_000)));
+      }
+      this.write(`\n${this.theme.muted(`DSH 执行完成 · ${seconds.toFixed(1)}s · 不计入本会话 token 用量`)}\n\n`);
+
+      // Record it so the conversation can reason about what the agent did.
+      const now = new Date().toISOString();
+      this.session.messages.push({ role: "user", content: `/do ${text}`, createdAt: now });
+      this.session.messages.push({
+        role: "assistant",
+        content: `[DSH 执行结果]\n${result.output}`,
+        createdAt: new Date().toISOString(),
+      });
+      if (this.session.title === "New conversation") this.session.title = deriveTitle(text);
+      await this.saveSession();
+    } catch (error) {
+      spinner.stop();
+      if ((error as Error).name === "AbortError") this.line(`${this.theme.yellow("已中断 DSH 执行。")}\n`);
+      else this.line(`${this.theme.red(`DSH 执行失败：${this.errorMessage(error)}`)}\n`);
+    } finally {
+      spinner.stop();
+      generationGuard.detach();
+      this.controller = undefined;
+    }
+  }
+
+  /** A short digest of recent turns, so a delegated task starts informed. */
+  private recentContext(maxChars = 4_000): string | undefined {
+    if (!this.session || this.session.messages.length === 0) return undefined;
+    const parts: string[] = [];
+    let used = 0;
+    for (let index = this.session.messages.length - 1; index >= 0; index -= 1) {
+      const message = this.session.messages[index];
+      if (!message || message.role === "system") continue;
+      const label = message.role === "user" ? "用户" : "助手";
+      const body = shortText(message.content, 1_200);
+      const entry = `${label}：${body}`;
+      if (used + entry.length > maxChars) break;
+      parts.unshift(entry);
+      used += entry.length;
+    }
+    if (parts.length === 0) return undefined;
+    return `以下是此前的对话背景，供你参考：\n\n${parts.join("\n\n")}`;
+  }
+
   private async openAndReport(url: string, label: string): Promise<void> {
     const opened = await openUrl(url);
     this.line(opened ? `${this.theme.green("✓")} 已打开${label}` : `${label}：${url}`);
@@ -1330,6 +1665,8 @@ export class DeepSeekTui {
     if (usage.promptCacheHitTokens > 0) parts.push(`缓存 ${formatCompactTokens(usage.promptCacheHitTokens)}`);
     parts.push(`${seconds.toFixed(1)}s`);
     if (usage.completionTokens > 0) parts.push(`${(usage.completionTokens / seconds).toFixed(1)} tok/s`);
+    const pricing = this.pricing();
+    if (pricing) parts.push(`≈${formatCost(estimateCost(usage, pricing))}`);
     return parts.join(" · ");
   }
 
@@ -1358,6 +1695,7 @@ export class DeepSeekTui {
     let reasoning = "";
     let reasoningShown = false;
     let contentShown = false;
+    const markdown = new MarkdownStream({ theme: this.theme });
     const spinner = new Spinner(this.output, (frame, elapsedMs) =>
       this.generationStatus(frame, elapsedMs, reasoning, "正在思考"),
     );
@@ -1392,10 +1730,11 @@ export class DeepSeekTui {
             this.write(`${this.theme.blue("◆ DeepSeek")}\n`);
             contentShown = true;
           }
-          this.write(safeTerminalText(delta));
+          this.write(markdown.write(delta));
         },
       });
       spinner.stop();
+      this.write(markdown.end());
       if (!contentShown) {
         this.write(`${this.theme.blue("◆ DeepSeek")}\n${this.theme.muted("(没有文本响应)")}`);
       }
@@ -1416,6 +1755,9 @@ export class DeepSeekTui {
       this.write(`\n\n${this.theme.muted(this.turnFooter(result.usage, elapsedMs))}\n\n`);
     } catch (error) {
       spinner.stop();
+      // Close a code fence the interrupted reply left open, or the frame
+      // would swallow every line printed after it.
+      this.write(markdown.end());
       // Keep a partial answer, but never store an assistant turn with empty
       // content: the API rejects it on the next request.
       if (content.trim()) {
@@ -1440,6 +1782,63 @@ export class DeepSeekTui {
       generationGuard.detach();
       this.controller = undefined;
     }
+  }
+
+  /** Rates for the session's model, or undefined when none are known. */
+  private pricing(): ModelPricing | undefined {
+    return this.session ? pricingFor(this.session.model, this.config.pricing) : undefined;
+  }
+
+  /**
+   * Warns that an action is about to rewrite the conversation prefix. The
+   * DeepSeek cache only serves a *fully* matching prefix, so rewriting any of
+   * it makes the next request pay miss rate for the whole replacement.
+   * Returns false when the user declines.
+   */
+  private async confirmPrefixLoss(action: string): Promise<boolean> {
+    if (!this.session || this.session.messages.length === 0) return true;
+    const loss = prefixLoss(this.session.messages, this.pricing());
+    if (loss.tokens <= 0) return true;
+    const money = loss.cost === undefined ? "" : `，下一轮约多付 ${this.theme.bold(`≈${formatCost(loss.cost)}`)}`;
+    this.line(
+      this.theme.yellow(
+        `${action}会重写会话前缀：约 ${formatCompactTokens(loss.tokens)} tokens 的上下文缓存将失效${money}。`,
+      ),
+    );
+    this.line(this.theme.muted("（DeepSeek 的缓存要求前缀完全匹配，改动早期历史后整段都按未命中计价）"));
+    const answer = await this.input.next(this.theme.brightBlue("继续？[y/N] › "), { history: false });
+    if (answer?.trim().toLocaleLowerCase() === "y") return true;
+    this.line(this.theme.muted("已取消。"));
+    return false;
+  }
+
+  /** /cache — how much the context cache is actually saving. */
+  private showCache(): void {
+    if (!this.session) return;
+    const pricing = this.pricing();
+    const report = cacheReport(this.session.usage, pricing);
+    this.line(this.theme.bold("上下文缓存"));
+    if (report.hitRate === undefined) {
+      this.line(this.theme.muted("  本会话还没有计费过的输入 token。"));
+    } else {
+      const tint = report.hitRate >= 60 ? this.theme.green : report.hitRate >= 25 ? this.theme.yellow : this.theme.muted;
+      this.line(
+        `  ${this.theme.muted(padToWidth("命中率", 8))}  ${tint(`${report.hitRate.toFixed(1)}%`)} ${this.theme.muted(`· 命中 ${formatCompactTokens(report.hitTokens)} · 未命中 ${formatCompactTokens(report.missTokens)}`)}`,
+      );
+    }
+    const resident = prefixLoss(this.session.messages, pricing);
+    this.line(
+      `  ${this.theme.muted(padToWidth("可复用", 8))}  ${formatCompactTokens(resident.tokens)} tokens ${this.theme.muted("（下一轮若不改动早期历史即可命中）")}`,
+    );
+    if (pricing) {
+      if (report.saved !== undefined) {
+        this.line(`  ${this.theme.muted(padToWidth("已省下", 8))}  ${this.theme.green(`≈${formatCost(report.saved)}`)} ${this.theme.muted("（相对全部按未命中计价）")}`);
+      }
+      this.line(`  ${this.theme.muted(padToWidth("本会话", 8))}  ${this.theme.bold(`≈${formatCost(estimateCost(this.session.usage, pricing))}`)} ${this.theme.muted("· 估算，按峰值价，可在 config.json 的 pricing 覆盖")}`);
+    } else {
+      this.line(this.theme.muted(`  ${this.session.model} 没有内置价目；可在 config.json 的 pricing 里补充后显示金额。`));
+    }
+    this.line(this.theme.muted("  提示：/compact 与切换模型都会让整段前缀失效。"));
   }
 
   private errorMessage(error: unknown): string {

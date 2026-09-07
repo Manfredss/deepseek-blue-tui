@@ -34,6 +34,25 @@ export interface DshState {
   dshVersion?: string;
 }
 
+export interface HeadlessResult {
+  /** Everything the agent printed on stdout, trimmed. */
+  output: string;
+  /** Exit code, or null when the process was killed by a signal. */
+  status: number | null;
+  timedOut: boolean;
+  stderr?: string;
+}
+
+// Only a global install (or an explicit path) is discoverable: an
+// `npx @deepseek-ai/dsh` copy lives inside npm's private cache, which is not
+// on PATH, so having run npx before does not count as installed.
+const DSH_MISSING_MESSAGE =
+  "未找到 DSH。请任选一种方式安装：\n" +
+  "  · 在本终端内输入 /dsh install（命令行下为 deepseek dsh install）\n" +
+  "  · 自行全局安装：npm install -g @deepseek-ai/dsh\n" +
+  "  · 已有一份 dsh：用 DEEPSEEK_DSH_COMMAND=<dsh 可执行文件路径> 指向它\n" +
+  "注意：npx 装的副本只在 npm 缓存里，不在 PATH 上，因此不会被自动发现。";
+
 export interface DshStatus {
   phase: "running" | "starting" | "stopped" | "external";
   port: number;
@@ -414,18 +433,7 @@ export class DshManager {
     if (current.phase === "external") throw new Error(`端口 ${port} 已被其他进程占用`);
 
     const command = options.command ?? resolveDshCommand();
-    if (!command) {
-      // Only a global install (or an explicit path) is discoverable: an
-      // `npx @deepseek-ai/dsh` copy lives inside npm's private cache, which
-      // is not on PATH, so having run npx before does not count as installed.
-      throw new Error(
-        "未找到 DSH。请任选一种方式安装：\n" +
-          "  · 在本终端内输入 /dsh install（命令行下为 deepseek dsh install）\n" +
-          "  · 自行全局安装：npm install -g @deepseek-ai/dsh\n" +
-          "  · 已有一份 dsh：用 DEEPSEEK_DSH_COMMAND=<dsh 可执行文件路径> 指向它\n" +
-          "注意：npx 装的副本只在 npm 缓存里，不在 PATH 上，因此不会被自动发现。",
-      );
-    }
+    if (!command) throw new Error(DSH_MISSING_MESSAGE);
     await ensurePrivateDirectory(this.home);
     await rotateLogIfNeeded(this.logPath);
     const logDescriptor = openSync(this.logPath, "a", 0o600);
@@ -477,6 +485,80 @@ export class DshManager {
       await delay(250);
     }
     return await this.status(port);
+  }
+
+  /**
+   * Runs one task through `dsh --profile headless`, which answers and exits.
+   *
+   * This is the handoff from chat to agent: the REPL is a cheap place to think,
+   * DSH is where things actually get edited and run. The task is passed as a
+   * single argv element (never a shell string) and the child inherits the
+   * scrubbed environment, so the chat client's credential does not cross into
+   * the Harness trust boundary.
+   */
+  async runHeadless(options: {
+    task: string;
+    cwd: string;
+    signal?: AbortSignal;
+    timeoutMs?: number;
+    onData?: (chunk: string) => void;
+    command?: DshCommand;
+  }): Promise<HeadlessResult> {
+    const task = options.task.trim();
+    if (!task) throw new Error("任务内容不能为空");
+    const command = options.command ?? resolveDshCommand();
+    if (!command) throw new Error(DSH_MISSING_MESSAGE);
+
+    const child = spawn(
+      command.command,
+      [...command.argsPrefix, "--profile", "headless", task],
+      {
+        cwd: options.cwd,
+        env: dshChildEnvironment(),
+        stdio: ["ignore", "pipe", "pipe"],
+        windowsHide: true,
+        ...(process.platform === "win32" && /\.(?:cmd|bat)$/i.test(command.command) ? { shell: true } : {}),
+      },
+    );
+
+    let output = "";
+    let errors = "";
+    let timedOut = false;
+    const collect = (stream: NodeJS.ReadableStream | null, onChunk: (text: string) => void): void => {
+      stream?.setEncoding("utf8");
+      stream?.on("data", (chunk: string) => onChunk(chunk));
+    };
+    collect(child.stdout, (chunk) => {
+      output += chunk;
+      options.onData?.(chunk);
+    });
+    collect(child.stderr, (chunk) => {
+      errors += chunk;
+    });
+
+    const stop = (): void => {
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
+    };
+    const onAbort = (): void => stop();
+    options.signal?.addEventListener("abort", onAbort, { once: true });
+    const timer = setTimeout(() => {
+      timedOut = true;
+      stop();
+    }, options.timeoutMs ?? 15 * 60_000);
+    timer.unref();
+
+    try {
+      const status = await new Promise<number | null>((resolveExit, rejectExit) => {
+        child.once("error", rejectExit);
+        child.once("close", (code) => resolveExit(code));
+      });
+      const result: HeadlessResult = { output: output.trim(), status, timedOut };
+      if (errors.trim()) result.stderr = redactSecrets(errors.trim());
+      return result;
+    } finally {
+      clearTimeout(timer);
+      options.signal?.removeEventListener("abort", onAbort);
+    }
   }
 
   async stop(): Promise<{ stopped: boolean; message: string }> {
