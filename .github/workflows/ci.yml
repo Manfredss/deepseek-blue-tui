@@ -82,21 +82,25 @@ jobs:
         run: npm pack --pack-destination "$RUNNER_TEMP"
         shell: bash
 
-      # The README tells people to install straight from this repo, so prove
-      # that exact command works on a clean machine — a local check cannot,
-      # since a dev box usually has the package linked already.
-      - name: Install from the git ref the way the README says
+      # The README tells people to install from a repo tarball URL, so prove
+      # that exact command works on a clean machine.
+      #
+      # It has to be the tarball and not `npm i -g github:owner/repo`: pacote
+      # prepares any git dependency whose package.json has a build, install,
+      # prepare or prepack script (pacote/lib/git.js), and that nested install
+      # inherits npm_config_global through the environment, so it installs the
+      # package globally on top of the bin links the outer install just made
+      # and dies with ENOTDIR. A tarball skips the git path entirely.
+      - name: Install from a repo tarball the way the README says
         shell: bash
         run: |
           set -euo pipefail
-          # Use the runner's own global prefix. Pointing npm at a custom one
-          # leaks npm_config_prefix/npm_config_global into the nested install
-          # npm runs to prepare a git dependency, which then collides with the
-          # bin links the outer install just made (ENOTDIR).
-          npm install -g --no-audit --no-fund \
-            "github:${{ github.repository }}#${{ github.sha }}"
-          deepseek --version
-          dstui --version
+          PREFIX="$RUNNER_TEMP/tarball-install"
+          npm install -g --prefix "$PREFIX" --no-audit --no-fund \
+            "https://github.com/${{ github.repository }}/archive/${{ github.sha }}.tar.gz"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then BIN_DIR="$PREFIX"; else BIN_DIR="$PREFIX/bin"; fi
+          "$BIN_DIR/deepseek" --version
+          "$BIN_DIR/dstui" --version
 
       - name: Install tarball into isolated prefix and run binaries
         shell: bash
