@@ -4,6 +4,13 @@
 
 ## [未发布]
 
+### 变更
+
+- **改用 GitHub Release 分发，`dist/` 退出版本库**。此前为了让「从仓库直接装」可行，构建产物被提交进 git；现在打 tag 会触发 [Release workflow](.github/workflows/release.yml) 构建并附带 tarball，源码树重新保持干净
+  - 安装地址固定为 `releases/latest/download/deepseek-blue-tui.tgz`，不随版本变化
+  - 发布前会跑完整测试、校验 tag 与 `package.json` 版本一致，并把打包结果装进隔离目录实际运行，通过才创建 Release
+  - CI 里「已提交的 dist 是否最新」这项检查随之移除；`install smoke` 打的包与 Release 资源构建方式完全一致，因此仍在持续验证真实安装物
+
 ## [0.3.1] - 2026-09-08
 
 ### 修复

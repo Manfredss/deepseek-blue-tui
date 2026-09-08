@@ -36,19 +36,6 @@ jobs:
       - name: Build
         run: npm run build
 
-      # dist/ is committed, because npm cannot build a package installed
-      # straight from a git source (it runs `prepare` without devDependencies
-      # available). A stale dist would silently ship old code to anyone
-      # installing from the repo, so fail the build instead.
-      - name: Committed dist is up to date
-        shell: bash
-        run: |
-          if ! git diff --quiet -- dist; then
-            echo "::error::dist/ is out of date — run 'npm run build' and commit the result"
-            git diff --stat -- dist
-            exit 1
-          fi
-
       - name: Verify built CLI
         run: node dist/cli.js --version
 
@@ -77,30 +64,11 @@ jobs:
           npm run build
 
       # Pack the real tarball, install it into an isolated prefix, and run
-      # both binaries — this is what `npm install -g` users will execute.
+      # both binaries. `npm pack` here is byte-for-byte how the release asset
+      # is built, so this exercises exactly what people install.
       - name: Pack tarball
         run: npm pack --pack-destination "$RUNNER_TEMP"
         shell: bash
-
-      # The README tells people to install from a repo tarball URL, so prove
-      # that exact command works on a clean machine.
-      #
-      # It has to be the tarball and not `npm i -g github:owner/repo`: pacote
-      # prepares any git dependency whose package.json has a build, install,
-      # prepare or prepack script (pacote/lib/git.js), and that nested install
-      # inherits npm_config_global through the environment, so it installs the
-      # package globally on top of the bin links the outer install just made
-      # and dies with ENOTDIR. A tarball skips the git path entirely.
-      - name: Install from a repo tarball the way the README says
-        shell: bash
-        run: |
-          set -euo pipefail
-          PREFIX="$RUNNER_TEMP/tarball-install"
-          npm install -g --prefix "$PREFIX" --no-audit --no-fund \
-            "https://github.com/${{ github.repository }}/archive/${{ github.sha }}.tar.gz"
-          if [[ "$RUNNER_OS" == "Windows" ]]; then BIN_DIR="$PREFIX"; else BIN_DIR="$PREFIX/bin"; fi
-          "$BIN_DIR/deepseek" --version
-          "$BIN_DIR/dstui" --version
 
       - name: Install tarball into isolated prefix and run binaries
         shell: bash

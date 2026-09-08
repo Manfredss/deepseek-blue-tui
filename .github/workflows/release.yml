@@ -1,0 +1,95 @@
+name: Release
+
+# Publishing happens here rather than from a laptop, so the artefact people
+# install is always built from a known commit by a clean machine.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build a release for"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and attach the install tarball
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Never publish something that does not pass its own tests.
+      - name: Typecheck and tests
+        run: npm run check
+
+      - name: Refuse to release a tag whose version does not match package.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${TAG_NAME}"
+          MANIFEST="v$(node -p "require('./package.json').version")"
+          if [[ "$TAG" != "$MANIFEST" ]]; then
+            echo "::error::tag $TAG does not match package.json ($MANIFEST)"
+            exit 1
+          fi
+        env:
+          TAG_NAME: ${{ github.event.inputs.tag || github.ref_name }}
+
+      - name: Pack
+        id: pack
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm pack --pack-destination dist-release
+          VERSIONED=$(ls dist-release/*.tgz)
+          # Also publish under a stable filename, so the README can point at
+          # releases/latest/download/… and never go out of date.
+          cp "$VERSIONED" dist-release/deepseek-blue-tui.tgz
+          echo "versioned=$VERSIONED" >> "$GITHUB_OUTPUT"
+
+      # Install the artefact exactly as a user would, before publishing it.
+      - name: Smoke test the tarball
+        shell: bash
+        run: |
+          set -euo pipefail
+          PREFIX="$RUNNER_TEMP/release-prefix"
+          npm install -g --prefix "$PREFIX" --no-audit --no-fund "$VERSIONED"
+          "$PREFIX/bin/deepseek" --version
+          "$PREFIX/bin/dstui" --version
+        env:
+          VERSIONED: ${{ steps.pack.outputs.versioned }}
+
+      - name: Create the release
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "安装："
+            echo
+            echo '```bash'
+            echo "npm install -g https://github.com/${REPO}/releases/latest/download/deepseek-blue-tui.tgz"
+            echo '```'
+            echo
+            echo "变更详情见 [CHANGELOG.md](https://github.com/${REPO}/blob/${TAG_NAME}/CHANGELOG.md)。"
+          } > release-notes.md
+          gh release create "$TAG_NAME" \
+            --title "$TAG_NAME" \
+            --notes-file release-notes.md \
+            dist-release/*.tgz
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG_NAME: ${{ github.event.inputs.tag || github.ref_name }}

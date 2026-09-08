@@ -110,24 +110,26 @@ Logo 只在交互模式出现：`--no-logo` 隐藏鲸鱼，`--no-color` 关闭 A
 ### 一行安装（推荐）
 
 ```bash
-npm install -g https://github.com/Manfredss/deepseek-blue-tui/archive/refs/heads/main.tar.gz
+npm install -g https://github.com/Manfredss/deepseek-blue-tui/releases/latest/download/deepseek-blue-tui.tgz
 ```
 
-装完 `deepseek` 与 `dstui` 两个命令即可使用（`dist/` 已随仓库提交，无需本地构建）。
+这个地址永远指向最新一次 Release 的构建产物，装完 `deepseek` 与 `dstui` 两个命令即可使用。
 
-想锁定某个版本，把 `refs/heads/main` 换成标签：
+想锁定某个版本，用带版本号的资源：
 
 ```bash
-npm install -g https://github.com/Manfredss/deepseek-blue-tui/archive/refs/tags/v0.3.1.tar.gz
+npm install -g https://github.com/Manfredss/deepseek-blue-tui/releases/download/v0.3.2/deepseek-blue-tui-0.3.2.tgz
 ```
 
 卸载：`npm uninstall -g deepseek-blue-tui`
 
+Release 里的 tarball 由 [Release workflow](.github/workflows/release.yml) 在打 tag 时构建：先跑完整测试、校验 tag 与 `package.json` 版本一致，再把打包结果装进隔离目录实际运行一遍，通过才发布。
+
 > [!NOTE]
 > 别用 `npm install -g github:Manfredss/deepseek-blue-tui`——那条路在当前 npm 上装不上。
-> 只要 `package.json` 里有 `build`/`install`/`prepare`/`prepack` 任一脚本，npm 就会为 git 依赖额外跑一次「准备」安装；
+> 只要 `package.json` 里有 `build`/`install`/`prepare`/`prepack` 任一脚本，npm 就会为 git 依赖额外跑一次「准备」安装（`pacote/lib/git.js`）；
 > 那个嵌套进程通过环境变量继承了 `npm_config_global`，于是把包再全局装一遍，和外层刚建好的 bin 链接撞车，报 `ENOTDIR`。
-> tarball 不走 git 那条路径，所以没这个问题。
+> Release 里的 tarball 不走 git 那条路径，所以没这个问题。
 
 ### 从本地源码安装
 
