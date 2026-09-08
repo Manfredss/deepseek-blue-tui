@@ -56,8 +56,11 @@ jobs:
           # --pack-destination does not create the directory, and npm fails
           # with ENOENT when it is missing.
           mkdir -p dist-release
+          rm -f dist-release/*.tgz
           npm pack --pack-destination dist-release
-          VERSIONED=$(ls dist-release/*.tgz)
+          # Absolute, because npm reads a relative path containing a slash as
+          # a GitHub owner/repo shorthand and tries to clone it.
+          VERSIONED="$PWD/$(ls dist-release/*.tgz | head -1)"
           # Also publish under a stable filename, so the README can point at
           # releases/latest/download/… and never go out of date.
           cp "$VERSIONED" dist-release/deepseek-blue-tui.tgz
