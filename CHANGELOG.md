@@ -4,6 +4,8 @@
 
 ## [未发布]
 
+## [0.3.0] - 2026-09-07
+
 ### 新增
 
 - **流式 Markdown 渲染**：此前助手回复是原样吐进终端的，代码块没有任何处理——对一个主要用来问编程问题的客户端，这是最大的体验缺口
@@ -144,6 +146,7 @@
 - 中性别名 `dstui` 与 `deepseek` 等价
 - macOS / Linux / Windows 的浏览器打开适配与 CI 矩阵（Node 22/24）
 
-[未发布]: https://github.com/Manfredss/deepseek-blue-tui/compare/v0.2.0...HEAD
+[未发布]: https://github.com/Manfredss/deepseek-blue-tui/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/Manfredss/deepseek-blue-tui/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/Manfredss/deepseek-blue-tui/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Manfredss/deepseek-blue-tui/releases/tag/v0.1.0
