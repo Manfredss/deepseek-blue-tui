@@ -4,6 +4,11 @@
 
 ## [未发布]
 
+### 文档
+
+- 新增英文 README（`README.en.md`）。中文 README 里那个 `[English]` 链接此前一直指向不存在的文件
+- 补齐仓库 description、homepage 与 topics —— 此前全为空，GitHub 的搜索排序与话题浏览重度依赖它们
+
 ## [0.3.3] - 2026-09-07
 
 ### 修复
