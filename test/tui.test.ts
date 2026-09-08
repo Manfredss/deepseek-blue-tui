@@ -47,6 +47,19 @@ async function settle(milliseconds = 60): Promise<void> {
   await new Promise<void>((resolve) => setTimeout(resolve, milliseconds));
 }
 
+/**
+ * Waits for something to actually happen rather than for a duration to pass.
+ * Sleeping a fixed time and hoping the stream got far enough makes a test that
+ * passes on a fast machine and fails on a loaded CI runner.
+ */
+async function until(check: () => boolean, message: string, timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!check()) {
+    if (Date.now() >= deadline) assert.fail(`timed out waiting: ${message}`);
+    await settle(20);
+  }
+}
+
 interface MockOptions {
   content?: string[];
   status?: number;
@@ -309,15 +322,23 @@ test("a turn that produces nothing leaves no orphan user message behind", async 
 });
 
 test("a partial answer is kept when the generation is interrupted", async (t: TestContext) => {
-  const baseUrl = await startMockApi(t, { content: ["一", "二", "三", "四", "五"], delayMs: 120 });
+  // Newline-terminated chunks, because the renderer emits a line at a time:
+  // without them nothing is displayed until the stream ends, and there is no
+  // in-flight moment to interrupt.
+  const baseUrl = await startMockApi(t, {
+    content: ["一\n", "二\n", "三\n", "四\n", "五\n"],
+    delayMs: 120,
+  });
   const app = await harness(t, { config: { baseUrl } });
   await app.start();
 
   app.input.write("慢慢来\n");
-  await settle(300);
+  // Interrupt once something has actually streamed, so there is a partial
+  // answer to keep. Waiting a fixed 300ms instead assumed a chunk had arrived,
+  // which a loaded runner does not guarantee.
+  await until(() => app.plain().includes("一"), "the first chunk should have streamed");
   app.input.write(ESC); // Esc aborts an in-flight generation.
-  await settle(400);
-  assert.match(app.plain(), /已中断本次生成/);
+  await until(() => app.plain().includes("已中断本次生成"), "Esc should abort the generation");
   await app.finish();
 
   const [saved] = await app.sessionStore.list({});
@@ -403,11 +424,12 @@ test("a slow command shows progress and survives the first Ctrl+C", async (t: Te
   // Ctrl+C reaches the client as a signal while no prompt is waiting; the
   // first press must not throw away the whole session.
   process.emit("SIGINT");
-  await settle(150);
-  assert.match(app.plain(), /命令执行中…再按一次 Ctrl\+C 退出/);
+  await until(
+    () => app.plain().includes("命令执行中"),
+    "the first Ctrl+C should warn rather than quit",
+  );
 
-  await settle(700);
-  assert.match(app.plain(), /仍在启动/, "the command still finished normally");
+  await until(() => app.plain().includes("仍在启动"), "the command should still finish normally");
   assert.match(await app.send("/status", 250), /状态/, "and the REPL kept going");
   await app.finish();
 });
@@ -540,7 +562,7 @@ test("/race runs each effort, compares them, and keeps only the chosen answer", 
 
   app.reset();
   app.input.write("/race low max 该怎么做\n");
-  await settle(700);
+  await until(() => app.plain().includes("保留哪一个"), "both branches should finish and offer a picker");
   const compared = app.plain();
   assert.match(compared, /并行对比 low \/ max/);
   assert.match(compared, /这是 low 档的回答/, "each branch really used its own effort");
@@ -548,7 +570,7 @@ test("/race runs each effort, compares them, and keeps only the chosen answer", 
   assert.match(compared, /保留哪一个/, "a picker offers the branches");
 
   app.input.write("\r"); // keep the highlighted (first) branch
-  await settle(400);
+  await until(() => app.plain().includes("已保留"), "the chosen branch should be kept");
   const kept = app.plain();
   assert.match(kept, /已保留 low 的回答/);
   await app.finish();
@@ -621,7 +643,7 @@ test("/do confirms first, then folds the agent's result into the conversation", 
   assert.doesNotMatch(confirm, /改了 2 个文件/, "nothing runs before the user agrees");
 
   app.input.write("y\n");
-  await settle(400);
+  await until(() => app.plain().includes("◆ DSH"), "the agent result should be rendered");
   const done = app.plain();
   assert.match(done, /◆ DSH/);
   assert.match(done, /改了 2 个文件/);
