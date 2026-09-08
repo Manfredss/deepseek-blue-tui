@@ -118,7 +118,7 @@ npm install -g https://github.com/Manfredss/deepseek-blue-tui/releases/latest/do
 想锁定某个版本，用带版本号的资源：
 
 ```bash
-npm install -g https://github.com/Manfredss/deepseek-blue-tui/releases/download/v0.3.2/deepseek-blue-tui-0.3.2.tgz
+npm install -g https://github.com/Manfredss/deepseek-blue-tui/releases/download/v0.3.3/deepseek-blue-tui-0.3.3.tgz
 ```
 
 卸载：`npm uninstall -g deepseek-blue-tui`

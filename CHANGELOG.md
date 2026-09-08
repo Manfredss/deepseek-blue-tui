@@ -4,6 +4,8 @@
 
 ## [未发布]
 
+## [0.3.3] - 2026-09-07
+
 ### 修复
 
 - **流式回复不再等到整行才显示**。0.3.0 引入的 Markdown 渲染逐行缓冲——必须看到换行才能判定这行是不是代码围栏/标题/列表——导致没有换行的段落在生成期间屏幕上毫无反应，写完才一次性蹦出来。中文自然段常一两百字不换行，按 50 tok/s 就是好几秒死寂，比渲染之前的手感更差
@@ -12,7 +14,7 @@
   - 实测（逐字符喂入）：中文长句首次输出从「直到流结束」变为**第 1 个字**；端到端从 1600ms 变为 22ms
   - 增量拼接的结果与一次性渲染**逐字节相同**，原有的「无论分片如何输出一致」不变量仍然成立
 
-## [0.3.2] - 2026-09-08
+## [0.3.2] - 2026-09-07
 
 ### 变更
 
@@ -21,7 +23,7 @@
   - 发布前会跑完整测试、校验 tag 与 `package.json` 版本一致，并把打包结果装进隔离目录实际运行，通过才创建 Release
   - CI 里「已提交的 dist 是否最新」这项检查随之移除；`install smoke` 打的包与 Release 资源构建方式完全一致，因此仍在持续验证真实安装物
 
-## [0.3.1] - 2026-09-08
+## [0.3.1] - 2026-09-07
 
 ### 修复
 
@@ -174,7 +176,8 @@
 - 中性别名 `dstui` 与 `deepseek` 等价
 - macOS / Linux / Windows 的浏览器打开适配与 CI 矩阵（Node 22/24）
 
-[未发布]: https://github.com/Manfredss/deepseek-blue-tui/compare/v0.3.2...HEAD
+[未发布]: https://github.com/Manfredss/deepseek-blue-tui/compare/v0.3.3...HEAD
+[0.3.3]: https://github.com/Manfredss/deepseek-blue-tui/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/Manfredss/deepseek-blue-tui/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/Manfredss/deepseek-blue-tui/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/Manfredss/deepseek-blue-tui/compare/v0.2.0...v0.3.0
