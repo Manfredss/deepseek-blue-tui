@@ -36,6 +36,19 @@ jobs:
       - name: Build
         run: npm run build
 
+      # dist/ is committed, because npm cannot build a package installed
+      # straight from a git source (it runs `prepare` without devDependencies
+      # available). A stale dist would silently ship old code to anyone
+      # installing from the repo, so fail the build instead.
+      - name: Committed dist is up to date
+        shell: bash
+        run: |
+          if ! git diff --quiet -- dist; then
+            echo "::error::dist/ is out of date — run 'npm run build' and commit the result"
+            git diff --stat -- dist
+            exit 1
+          fi
+
       - name: Verify built CLI
         run: node dist/cli.js --version
 
