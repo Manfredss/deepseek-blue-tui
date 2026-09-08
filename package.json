@@ -21,7 +21,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "node --import tsx --test test/*.test.ts",
     "check": "npm run typecheck && npm test",
-    "prepare": "npm run build"
+    "prepare": "node node_modules/typescript/bin/tsc -p tsconfig.json"
   },
   "keywords": [
     "deepseek",
