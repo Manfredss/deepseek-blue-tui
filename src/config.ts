@@ -3,6 +3,7 @@ import { join, resolve } from "node:path";
 import { readFile } from "node:fs/promises";
 import { DEFAULT_CONFIG, REASONING_EFFORTS, type AppConfig, type ReasoningEffort } from "./types.js";
 import { isRecord, writeJsonAtomic } from "./fs-utils.js";
+import { normalizePricing } from "./pricing.js";
 
 export function resolveAppHome(env: NodeJS.ProcessEnv = process.env): string {
   if (env.DEEPSEEK_TUI_HOME?.trim()) return resolve(env.DEEPSEEK_TUI_HOME.trim());
@@ -51,6 +52,8 @@ export function normalizeConfig(value: unknown): AppConfig {
     effort: isValidEffort(value.effort) ? value.effort : DEFAULT_CONFIG.effort,
   };
   if (typeof value.apiKey === "string" && value.apiKey.trim()) config.apiKey = value.apiKey.trim();
+  const pricing = normalizePricing(value.pricing);
+  if (pricing) config.pricing = pricing;
   return config;
 }
 

@@ -232,6 +232,8 @@ export class LineInput {
   private suggestionValues: readonly string[] = [];
   private readonly history: LineInputHistory | undefined;
   private historyEnabled = true;
+  /** Nesting depth of suspendForMenu, so overlapping suspensions pair up. */
+  private suspendDepth = 0;
   onInterrupt?: () => void;
 
   constructor(options: {
@@ -618,6 +620,12 @@ export class LineInput {
    */
   suspendForMenu(): void {
     if (this.closed) return;
+    // Suspensions can nest (a picker opened while a generation guard holds the
+    // terminal). Only the outermost may tear the interface down: rebuilding it
+    // twice leaves two live readlines on one stream, and the second one queues
+    // every submitted line for replay — every command then runs twice.
+    this.suspendDepth += 1;
+    if (this.suspendDepth > 1) return;
     this.promptEpoch += 1;
     this.menuCapacity = 0;
     this.suggestionsActive = false;
@@ -639,6 +647,9 @@ export class LineInput {
   /** Rebuilds the readline interface after a MenuPicker finished. */
   resumeFromMenu(): void {
     if (this.closed) return;
+    if (this.suspendDepth === 0) return;
+    this.suspendDepth -= 1;
+    if (this.suspendDepth > 0) return;
     if ((this.input as NodeJS.ReadStream).isTTY) {
       this.pasteInput = new BracketedPasteInput(
         (value) => this.replacePaste(value),
@@ -731,6 +742,7 @@ export class LineInput {
   }
 
   close(): void {
+    this.suspendDepth = 0;
     if (!this.closed) this.interface.close();
   }
 }

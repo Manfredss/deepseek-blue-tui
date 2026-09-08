@@ -52,6 +52,8 @@ export interface AppConfig {
   contextLimitTokens: number;
   /** DeepSeek V4 thinking effort (OpenAI format: low/high/max). */
   effort: ReasoningEffort;
+  /** Per-model USD/1M-token overrides; published defaults go stale. */
+  pricing?: Record<string, { cacheHit: number; cacheMiss: number; output: number }>;
 }
 
 export interface BalanceInfo {
