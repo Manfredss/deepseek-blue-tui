@@ -4,6 +4,14 @@
 
 ## [未发布]
 
+### 修复
+
+- **直接从 GitHub 安装装不出可执行文件**：`dist/` 不进 git，而构建挂在 `prepack` 上——npm 从 git 源安装时跑的是 `prepare`，于是没人触发构建，`files: ["dist"]` 指向空目录，装完什么都没有。改为 `prepare` 后 `npm install -g github:Manfredss/deepseek-blue-tui` 可用（`prepare` 同样覆盖 `npm pack` / `npm publish`，因此 `prepack` 不再需要）
+
+### 文档
+
+- 安装一节改以「直接从仓库安装」为主，并说明本项目未发布到 npm
+
 ## [0.3.0] - 2026-09-07
 
 ### 新增

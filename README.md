@@ -105,7 +105,28 @@ Logo 只在交互模式出现：`--no-logo` 隐藏鲸鱼，`--no-color` 关闭 A
 
 ## 安装
 
-### 从源码安装
+本项目**没有发布到 npm**，直接从这个仓库安装即可。
+
+### 一行安装（推荐）
+
+```bash
+npm install -g github:Manfredss/deepseek-blue-tui
+deepseek --version
+```
+
+npm 会克隆仓库、装好依赖并自动构建（`prepare` 钩子），之后 `deepseek` 与 `dstui` 两个命令即可使用。
+
+想装某个特定版本，在后面加上标签：
+
+```bash
+npm install -g github:Manfredss/deepseek-blue-tui#v0.3.0
+```
+
+卸载：`npm uninstall -g deepseek-blue-tui`
+
+### 从本地源码安装
+
+想改代码就用这种：
 
 ```bash
 git clone https://github.com/Manfredss/deepseek-blue-tui.git
@@ -114,8 +135,6 @@ npm ci
 npm install -g .
 deepseek --version
 ```
-
-发布到 npm 后也可以直接 `npm install -g deepseek-blue-tui`（**包名当前尚未发布**，发布前请勿执行）。
 
 不想全局安装时，可以直接开发运行：
 
