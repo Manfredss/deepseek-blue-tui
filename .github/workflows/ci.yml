@@ -89,12 +89,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          PREFIX="$RUNNER_TEMP/git-install-prefix"
-          npm_config_prefix="$PREFIX" npm install -g --no-audit --no-fund \
+          # Use the runner's own global prefix. Pointing npm at a custom one
+          # leaks npm_config_prefix/npm_config_global into the nested install
+          # npm runs to prepare a git dependency, which then collides with the
+          # bin links the outer install just made (ENOTDIR).
+          npm install -g --no-audit --no-fund \
             "github:${{ github.repository }}#${{ github.sha }}"
-          if [[ "$RUNNER_OS" == "Windows" ]]; then BIN_DIR="$PREFIX"; else BIN_DIR="$PREFIX/bin"; fi
-          "$BIN_DIR/deepseek" --version
-          "$BIN_DIR/dstui" --version
+          deepseek --version
+          dstui --version
 
       - name: Install tarball into isolated prefix and run binaries
         shell: bash
