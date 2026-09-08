@@ -4,6 +4,8 @@
 
 ## [未发布]
 
+## [0.3.2] - 2026-09-08
+
 ### 变更
 
 - **改用 GitHub Release 分发，`dist/` 退出版本库**。此前为了让「从仓库直接装」可行，构建产物被提交进 git；现在打 tag 会触发 [Release workflow](.github/workflows/release.yml) 构建并附带 tarball，源码树重新保持干净
@@ -164,7 +166,8 @@
 - 中性别名 `dstui` 与 `deepseek` 等价
 - macOS / Linux / Windows 的浏览器打开适配与 CI 矩阵（Node 22/24）
 
-[未发布]: https://github.com/Manfredss/deepseek-blue-tui/compare/v0.3.1...HEAD
+[未发布]: https://github.com/Manfredss/deepseek-blue-tui/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/Manfredss/deepseek-blue-tui/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/Manfredss/deepseek-blue-tui/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/Manfredss/deepseek-blue-tui/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/Manfredss/deepseek-blue-tui/compare/v0.1.0...v0.2.0
