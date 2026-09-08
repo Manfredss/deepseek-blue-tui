@@ -137,8 +137,53 @@ function tintCode(line: string, theme: Theme, state: CodeState): string {
   return out;
 }
 
-/** Inline Markdown outside code: `code`, **bold**, *em*, and [text](url). */
-function inlineMarkdown(text: string, theme: Theme): string {
+/** The inline constructs, tried in order at a given position. */
+const INLINE_PATTERNS = [
+  /^`[^`\n]+`/u,
+  /^\*\*[^*\n]+\*\*/u,
+  /^[*_][^*_\n]+[*_](?!\w)/u,
+  /^\[[^\]\n]*\]\([^)\s]+\)/u,
+] as const;
+
+/** Characters that can open an inline construct. */
+const INLINE_OPENERS = "`*_[";
+
+/**
+ * How much of `text` is safe to emit now: everything before an inline marker
+ * that has not closed yet. Splitting there means the pieces can be rendered
+ * separately and concatenated to exactly what rendering the whole would give,
+ * which is what lets output stream without changing.
+ */
+function stableInlineLength(text: string, precededBy: string): number {
+  let index = 0;
+  while (index < text.length) {
+    const character = text[index] ?? "";
+    if (!INLINE_OPENERS.includes(character)) {
+      index += 1;
+      continue;
+    }
+    const rest = text.slice(index);
+    const previous = index === 0 ? precededBy : (text[index - 1] ?? "");
+    // `_` inside a word is an identifier, not emphasis, so it opens nothing.
+    if ((character === "_" || character === "*") && /\w/u.test(previous)) {
+      index += 1;
+      continue;
+    }
+    const match = INLINE_PATTERNS.find((pattern) => pattern.test(rest));
+    if (!match) return index; // may still close once more text arrives
+    index += (match.exec(rest)?.[0].length ?? 1);
+  }
+  return text.length;
+}
+
+/**
+ * Inline Markdown outside code: `code`, **bold**, *em*, and [text](url).
+ *
+ * `precededBy` is the character before `text` in the original line. It matters
+ * because emphasis must not fire mid-word, and when a line is rendered in
+ * pieces the previous character is no longer in `text`.
+ */
+function inlineMarkdown(text: string, theme: Theme, precededBy = ""): string {
   if (!theme.enabled) return text;
   let result = "";
   let index = 0;
@@ -159,8 +204,9 @@ function inlineMarkdown(text: string, theme: Theme): string {
     }
     const emphasis = /^[*_]([^*_\n]+)[*_](?!\w)/u.exec(rest);
     // Anchored at `rest`, a lookbehind would always see the empty string, so
-    // the "not mid-word" check has to read the original text.
-    if (emphasis?.[1] && (index === 0 || !/\w/u.test(text[index - 1] ?? ""))) {
+    // the "not mid-word" check has to read the character before it.
+    const previous = index === 0 ? precededBy : (text[index - 1] ?? "");
+    if (emphasis?.[1] && !/\w/u.test(previous)) {
       result += theme.brightBlue(emphasis[1]);
       index += emphasis[0].length;
       continue;
@@ -187,10 +233,21 @@ export interface MarkdownStreamOptions {
  * Feed deltas in, get terminal-ready text out. Call `end()` once the stream
  * finishes to flush a trailing partial line and close an unterminated fence.
  */
+/** Lines whose rendering only makes sense once the whole line is known. */
+const HOLD_WHOLE_LINE = /^\s*(?:`{3,}|~{3,}|\||#{1,6}\s|>)/u;
+
+/** A partial line that could still turn into something structural. */
+const UNDECIDED = /^\s*(?:#{1,6}|[-*+_]+|\d{1,3}[.)]?|`{1,2}|~{1,2}|>)?\s*$/u;
+
 export class MarkdownStream {
   private readonly theme: Theme;
   private readonly gutter: string;
-  private buffer = "";
+  /** The current line so far, including anything already emitted. */
+  private line = "";
+  /** How much of `line` has been written out. */
+  private consumed = 0;
+  /** Set once the line is classified and its prefix emitted. */
+  private streaming = false;
   private inFence = false;
   private fenceMarker = "";
   private codeState: CodeState = { blockComment: false };
@@ -206,23 +263,27 @@ export class MarkdownStream {
   }
 
   write(delta: string): string {
-    this.buffer += safe(delta);
+    let pending = safe(delta);
     let out = "";
-    let newline = this.buffer.indexOf("\n");
-    while (newline >= 0) {
-      out += `${this.renderLine(this.buffer.slice(0, newline))}\n`;
-      this.buffer = this.buffer.slice(newline + 1);
-      newline = this.buffer.indexOf("\n");
+    for (;;) {
+      const newline = pending.indexOf("\n");
+      if (newline < 0) break;
+      this.line += pending.slice(0, newline);
+      pending = pending.slice(newline + 1);
+      out += `${this.finishLine()}\n`;
+      this.resetLine();
     }
+    this.line += pending;
+    out += this.stream();
     return out;
   }
 
   /** Flushes whatever is buffered; closes a code block left hanging. */
   end(): string {
     let out = "";
-    if (this.buffer) {
-      out += this.renderLine(this.buffer);
-      this.buffer = "";
+    if (this.line) {
+      out += this.finishLine();
+      this.resetLine();
     }
     if (this.inFence) {
       out += `\n${this.theme.muted("└─")}`;
@@ -231,6 +292,70 @@ export class MarkdownStream {
       this.codeState = { blockComment: false };
     }
     return out;
+  }
+
+  private resetLine(): void {
+    this.line = "";
+    this.consumed = 0;
+    this.streaming = false;
+  }
+
+  /**
+   * Emits as much of the current partial line as can be committed to.
+   *
+   * Prose and list items stream as they arrive, because holding a paragraph
+   * until its newline leaves the screen blank for as long as the paragraph
+   * takes to generate. Everything whose rendering depends on the whole line —
+   * fences, headings, quotes, tables, rules — still waits.
+   */
+  private stream(): string {
+    if (this.inFence) return ""; // code is tinted and guttered per line
+    if (!this.streaming) {
+      if (HOLD_WHOLE_LINE.test(this.line) || UNDECIDED.test(this.line)) return "";
+      const opened = this.openLine();
+      if (opened === undefined) return "";
+      this.streaming = true;
+      return opened + this.emitStable();
+    }
+    return this.emitStable();
+  }
+
+  /** Classifies the line, emitting any list marker. */
+  private openLine(): string | undefined {
+    const bullet = BULLET.exec(this.line);
+    if (bullet?.[3] !== undefined) {
+      this.consumed = this.line.length - bullet[3].length;
+      return `${bullet[1] ?? ""}${this.theme.blue("•")} `;
+    }
+    const ordered = ORDERED.exec(this.line);
+    if (ordered?.[3] !== undefined) {
+      this.consumed = this.line.length - ordered[3].length;
+      return `${ordered[1] ?? ""}${this.theme.blue(ordered[2] ?? "")} `;
+    }
+    this.consumed = 0;
+    return "";
+  }
+
+  /** Emits the part of the line that no pending inline marker can change. */
+  private emitStable(): string {
+    const rest = this.line.slice(this.consumed);
+    if (!rest) return "";
+    const precededBy = this.consumed > 0 ? (this.line[this.consumed - 1] ?? "") : "";
+    const safeLength = stableInlineLength(rest, precededBy);
+    if (safeLength <= 0) return "";
+    const piece = rest.slice(0, safeLength);
+    this.consumed += safeLength;
+    return inlineMarkdown(piece, this.theme, precededBy);
+  }
+
+  /** Completes the current line, streamed or not. */
+  private finishLine(): string {
+    if (!this.streaming) return this.renderLine(this.line);
+    const rest = this.line.slice(this.consumed);
+    if (!rest) return "";
+    const precededBy = this.consumed > 0 ? (this.line[this.consumed - 1] ?? "") : "";
+    this.consumed = this.line.length;
+    return inlineMarkdown(rest, this.theme, precededBy);
   }
 
   private renderLine(line: string): string {

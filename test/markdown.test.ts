@@ -120,3 +120,59 @@ test("a plain theme emits no escape sequences at all", () => {
   assert.equal(rendered, stripAnsi(rendered), "NO_COLOR output must stay plain");
   assert.match(rendered, /┌─ ts/, "structure is still drawn without colour");
 });
+
+// ---------------------------------------------------------------------------
+// Streaming latency: holding a paragraph until its newline leaves the screen
+// blank for as long as the paragraph takes to generate.
+// ---------------------------------------------------------------------------
+
+test("prose appears as it arrives rather than waiting for the newline", () => {
+  const stream = new MarkdownStream({ theme: plainTheme });
+  const opening = stream.write("这是一个");
+  assert.equal(opening, "这是一个", "the first characters must reach the terminal immediately");
+  assert.equal(stream.write("很长的段落"), "很长的段落", "and so must each later chunk");
+  assert.equal(stream.end(), "");
+});
+
+test("a list item streams its text once the marker resolves", () => {
+  const stream = new MarkdownStream({ theme: plainTheme });
+  assert.equal(stream.write("- "), "", "a bare marker could still be a horizontal rule");
+  assert.match(stream.write("第一项"), /• 第一项$/u, "once it is a bullet, the text flows");
+  assert.equal(stream.write("的后半段"), "的后半段");
+  stream.end();
+});
+
+test("lines whose meaning needs the whole line are still held", () => {
+  for (const [label, partial] of [
+    ["fence", "```t"],
+    ["heading", "# 标"],
+    ["quote", "> 引"],
+    ["table", "| a "],
+  ] as const) {
+    const stream = new MarkdownStream({ theme: plainTheme });
+    assert.equal(stream.write(partial), "", `${label} must not be emitted half-classified`);
+    stream.end();
+  }
+});
+
+test("an unclosed inline marker holds back only its own tail", () => {
+  const stream = new MarkdownStream({ theme });
+  // Everything before the backtick is safe; the backtick might still close.
+  assert.equal(stripAnsi(stream.write("先看 `estimate")), "先看 ");
+  const closed = stream.write("Tokens` 这个函数");
+  assert.equal(stripAnsi(closed), "estimateTokens 这个函数", "the construct renders once it closes");
+  assert.match(closed, /\u001b\[36m/u, "and it is styled as inline code");
+  stream.end();
+});
+
+test("streaming a code block still frames it correctly", () => {
+  const stream = new MarkdownStream({ theme: plainTheme });
+  let out = stream.write("```ts\n");
+  assert.match(out, /┌─ ts/, "the header appears once the fence line completes");
+  out += stream.write("const x");
+  out += stream.write(" = 1;\n");
+  assert.match(out, /│ const x = 1;/, "code is emitted a line at a time");
+  out += stream.write("```");
+  out += stream.end();
+  assert.match(out, /└─/);
+});
