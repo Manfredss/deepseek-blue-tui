@@ -53,6 +53,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # --pack-destination does not create the directory, and npm fails
+          # with ENOENT when it is missing.
+          mkdir -p dist-release
           npm pack --pack-destination dist-release
           VERSIONED=$(ls dist-release/*.tgz)
           # Also publish under a stable filename, so the README can point at
