@@ -110,19 +110,24 @@ Logo 只在交互模式出现：`--no-logo` 隐藏鲸鱼，`--no-color` 关闭 A
 ### 一行安装（推荐）
 
 ```bash
-npm install -g github:Manfredss/deepseek-blue-tui
-deepseek --version
+npm install -g https://github.com/Manfredss/deepseek-blue-tui/archive/refs/heads/main.tar.gz
 ```
 
-npm 会克隆仓库、装好依赖并自动构建（`prepare` 钩子），之后 `deepseek` 与 `dstui` 两个命令即可使用。
+装完 `deepseek` 与 `dstui` 两个命令即可使用（`dist/` 已随仓库提交，无需本地构建）。
 
-想装某个特定版本，在后面加上标签：
+想锁定某个版本，把 `refs/heads/main` 换成标签：
 
 ```bash
-npm install -g github:Manfredss/deepseek-blue-tui#v0.3.0
+npm install -g https://github.com/Manfredss/deepseek-blue-tui/archive/refs/tags/v0.3.0.tar.gz
 ```
 
 卸载：`npm uninstall -g deepseek-blue-tui`
+
+> [!NOTE]
+> 别用 `npm install -g github:Manfredss/deepseek-blue-tui`——那条路在当前 npm 上装不上。
+> 只要 `package.json` 里有 `build`/`install`/`prepare`/`prepack` 任一脚本，npm 就会为 git 依赖额外跑一次「准备」安装；
+> 那个嵌套进程通过环境变量继承了 `npm_config_global`，于是把包再全局装一遍，和外层刚建好的 bin 链接撞车，报 `ENOTDIR`。
+> tarball 不走 git 那条路径，所以没这个问题。
 
 ### 从本地源码安装
 

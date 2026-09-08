@@ -10,7 +10,8 @@
 
 ### 文档
 
-- 安装一节改以「直接从仓库安装」为主，并说明本项目未发布到 npm
+- 安装一节改以「从仓库 tarball 一行安装」为主，并说明本项目未发布到 npm
+- 明确记录 `npm install -g github:owner/repo` 为何不可用：`package.json` 里只要有 `build`/`install`/`prepare`/`prepack` 任一脚本，pacote 就会为 git 依赖跑一次嵌套「准备」安装（`pacote/lib/git.js`），而它经环境变量继承了 `npm_config_global`，把包再全局装一遍并与外层刚建的 bin 链接撞车（`ENOTDIR`）
 
 ## [0.3.0] - 2026-09-07
 
