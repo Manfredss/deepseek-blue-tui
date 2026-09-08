@@ -4,6 +4,8 @@
 
 ## [未发布]
 
+## [0.3.1] - 2026-09-08
+
 ### 修复
 
 - **直接从 GitHub 安装装不出可执行文件**：`dist/` 不进 git，而构建挂在 `prepack` 上——npm 从 git 源安装时跑的是 `prepare`，于是没人触发构建，`files: ["dist"]` 指向空目录，装完什么都没有。改为 `prepare` 后 `npm install -g github:Manfredss/deepseek-blue-tui` 可用（`prepare` 同样覆盖 `npm pack` / `npm publish`，因此 `prepack` 不再需要）
@@ -155,7 +157,8 @@
 - 中性别名 `dstui` 与 `deepseek` 等价
 - macOS / Linux / Windows 的浏览器打开适配与 CI 矩阵（Node 22/24）
 
-[未发布]: https://github.com/Manfredss/deepseek-blue-tui/compare/v0.3.0...HEAD
+[未发布]: https://github.com/Manfredss/deepseek-blue-tui/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/Manfredss/deepseek-blue-tui/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/Manfredss/deepseek-blue-tui/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/Manfredss/deepseek-blue-tui/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Manfredss/deepseek-blue-tui/releases/tag/v0.1.0

@@ -118,7 +118,7 @@ npm install -g https://github.com/Manfredss/deepseek-blue-tui/archive/refs/heads
 想锁定某个版本，把 `refs/heads/main` 换成标签：
 
 ```bash
-npm install -g https://github.com/Manfredss/deepseek-blue-tui/archive/refs/tags/v0.3.0.tar.gz
+npm install -g https://github.com/Manfredss/deepseek-blue-tui/archive/refs/tags/v0.3.1.tar.gz
 ```
 
 卸载：`npm uninstall -g deepseek-blue-tui`
