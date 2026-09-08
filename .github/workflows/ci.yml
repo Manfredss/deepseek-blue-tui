@@ -82,6 +82,20 @@ jobs:
         run: npm pack --pack-destination "$RUNNER_TEMP"
         shell: bash
 
+      # The README tells people to install straight from this repo, so prove
+      # that exact command works on a clean machine — a local check cannot,
+      # since a dev box usually has the package linked already.
+      - name: Install from the git ref the way the README says
+        shell: bash
+        run: |
+          set -euo pipefail
+          PREFIX="$RUNNER_TEMP/git-install-prefix"
+          npm_config_prefix="$PREFIX" npm install -g --no-audit --no-fund \
+            "github:${{ github.repository }}#${{ github.sha }}"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then BIN_DIR="$PREFIX"; else BIN_DIR="$PREFIX/bin"; fi
+          "$BIN_DIR/deepseek" --version
+          "$BIN_DIR/dstui" --version
+
       - name: Install tarball into isolated prefix and run binaries
         shell: bash
         run: |
