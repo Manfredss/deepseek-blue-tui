@@ -4,10 +4,19 @@
 
 ## [未发布]
 
-### 文档
+## [0.4.0] - 2026-09-10
 
-- 新增英文 README（`README.en.md`）。中文 README 里那个 `[English]` 链接此前一直指向不存在的文件
-- 补齐仓库 description、homepage 与 topics —— 此前全为空，GitHub 的搜索排序与话题浏览重度依赖它们
+### 新增
+
+- **实时用量与余额**。每轮页脚在原有 token / 耗时 / 花费之后追加账户余额
+  - 余额**不在请求路径上**：启动取一次、每轮结束后台刷新，慢的余额接口不会拖住下一句话；查询失败只是不再显示，不打断会话
+  - 两次刷新之间按本轮估算成本本地扣减，所以数字每轮都会动。此时带 `≈` 前缀表示推算值，刚读回的不带
+  - `/status` 新增「余额」行
+
+### 内部
+
+- 斜杠菜单的滚动测试此前硬编码「第 5 个命令是 `/status`」，任何位置新增命令都会让它失败——那与被测的滚动行为无关。改为从 `SLASH_COMMANDS` 推导
+- TUI 测试夹具的 `start()` 现在返回启动屏输出，便于断言欢迎页内容
 
 ## [0.3.3] - 2026-09-07
 
@@ -181,7 +190,8 @@
 - 中性别名 `dstui` 与 `deepseek` 等价
 - macOS / Linux / Windows 的浏览器打开适配与 CI 矩阵（Node 22/24）
 
-[未发布]: https://github.com/Manfredss/deepseek-blue-tui/compare/v0.3.3...HEAD
+[未发布]: https://github.com/Manfredss/deepseek-blue-tui/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/Manfredss/deepseek-blue-tui/compare/v0.3.3...v0.4.0
 [0.3.3]: https://github.com/Manfredss/deepseek-blue-tui/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/Manfredss/deepseek-blue-tui/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/Manfredss/deepseek-blue-tui/compare/v0.3.0...v0.3.1

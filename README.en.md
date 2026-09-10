@@ -60,7 +60,7 @@ npm install -g https://github.com/Manfredss/deepseek-blue-tui/releases/latest/do
 That URL always points at the newest release. To pin a version:
 
 ```bash
-npm install -g https://github.com/Manfredss/deepseek-blue-tui/releases/download/v0.3.3/deepseek-blue-tui-0.3.3.tgz
+npm install -g https://github.com/Manfredss/deepseek-blue-tui/releases/download/v0.4.0/deepseek-blue-tui-0.4.0.tgz
 ```
 
 Uninstall with `npm uninstall -g deepseek-blue-tui`.
@@ -189,6 +189,18 @@ Keep which one? (the rest are discarded)
 Discarded branches are **still billed**, so all of them count toward session usage — and the UI says so.
 
 ---
+
+## Live usage and balance
+
+Each turn ends with what it actually cost and what is left:
+
+```
+30,000 in · 2,000 out · cache 28k · 3.4s · 588 tok/s · ≈$0.0039 · 余额 ≈42.47 CNY
+```
+
+The balance is **never on the request path**: fetched once at startup and refreshed in the background after a turn, so a slow balance endpoint cannot hold up your next message. Between refreshes it is decremented locally by the estimated cost, which is why it moves every turn — a `≈` marks a figure carried forward that way, and its absence means it was just read from the API.
+
+A failed lookup never disturbs the session; the figure simply stops being shown.
 
 ## Context cache and cost
 

@@ -118,7 +118,7 @@ npm install -g https://github.com/Manfredss/deepseek-blue-tui/releases/latest/do
 想锁定某个版本，用带版本号的资源：
 
 ```bash
-npm install -g https://github.com/Manfredss/deepseek-blue-tui/releases/download/v0.3.3/deepseek-blue-tui-0.3.3.tgz
+npm install -g https://github.com/Manfredss/deepseek-blue-tui/releases/download/v0.4.0/deepseek-blue-tui-0.4.0.tgz
 ```
 
 卸载：`npm uninstall -g deepseek-blue-tui`
@@ -208,7 +208,7 @@ npm uninstall -g deepseek-blue-tui
 | `/rename <标题>` | 重命名当前会话，最长 100 个字符 |
 | `/thinking [on\|off]` | 显示、隐藏或切换思考过程的可见性 |
 | `/effort [low\|high\|max]` | 无参数打开选择菜单；直接传档位立即切换 |
-| `/status` | 一屏状态面板：模型/Endpoint、思考强度、上下文占用、Token 与缓存、最近一轮 TPS、会话、遮罩凭据、工作目录与 DSH |
+| `/status` | 一屏状态面板：模型/Endpoint、思考强度、上下文占用、Token 与缓存、最近一轮 TPS、会话、遮罩凭据、**账户余额**、工作目录与 DSH |
 | `/context` | 上下文报告 + 逐条消息 token 估算与按角色/思考的分段构成 |
 | `/cache` | 上下文缓存命中率、可复用前缀大小与本会话花费估算 |
 | `/btw <问题>` | 侧问：复用当前上下文做单轮问答，不写入会话历史、不计入会话 Token |
@@ -388,6 +388,18 @@ DSH 会在上述目录里真实修改文件、执行命令，且使用它自己�
 ```
 
 没有内置价目的模型只显示 token，不会编造金额。
+
+## 实时用量与余额
+
+每轮结束的页脚会带上这一轮的实际用量和账户余额：
+
+```
+30,000 in · 2,000 out · 缓存 28k · 3.4s · 588 tok/s · ≈$0.0039 · 余额 ≈42.47 CNY
+```
+
+余额**不在请求路径上**：启动时取一次，每轮结束后在后台刷新，慢的余额接口不会拖住你的下一句话。两次刷新之间按本轮估算成本在本地扣减，所以数字每轮都会动——此时带 `≈` 前缀，表示是推算值；刚从接口读回的则不带。
+
+查询失败不会打断会话，只是不再显示。
 
 ## 上下文缓存
 
