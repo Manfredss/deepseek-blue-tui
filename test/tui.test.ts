@@ -135,7 +135,8 @@ interface Harness {
   reset: () => void;
   /** Submits a line and waits for the REPL to come back to the prompt. */
   send: (line: string, waitMs?: number) => Promise<string>;
-  start: () => Promise<void>;
+  /** Starts the REPL and returns whatever the startup screen printed. */
+  start: () => Promise<string>;
   finish: () => Promise<void>;
 }
 
@@ -191,7 +192,9 @@ async function harness(
     start: async () => {
       running = tui.run();
       await settle(150);
+      const startup = plain();
       reset();
+      return startup;
     },
     finish: async () => {
       input.write("/exit\n");
@@ -740,4 +743,66 @@ test("nested suspensions rebuild the line editor only once", async () => {
   lineInput.close();
   assert.deepEqual(lines, ["hello"]);
   assert.equal(extra, "<no duplicate>", "the line must not be delivered a second time");
+});
+
+// ---------------------------------------------------------------------------
+// Live balance.
+// ---------------------------------------------------------------------------
+
+test("balance is fetched off the request path and carried forward between turns", async (t: TestContext) => {
+  let balanceCalls = 0;
+  let remaining = 42.5;
+  const server: Server = createServer((request, response) => {
+    request.resume();
+    request.on("end", () => {
+      if ((request.url ?? "").endsWith("/user/balance")) {
+        balanceCalls += 1;
+        response.writeHead(200, { "Content-Type": "application/json" });
+        response.end(
+          JSON.stringify({
+            is_available: true,
+            balance_infos: [
+              { currency: "CNY", total_balance: remaining.toFixed(2), granted_balance: "0.00", topped_up_balance: remaining.toFixed(2) },
+            ],
+          }),
+        );
+        return;
+      }
+      remaining -= 0.03;
+      response.writeHead(200, { "Content-Type": "text/event-stream" });
+      response.write(`data: ${JSON.stringify({ choices: [{ delta: { content: "答案\n" } }] })}\n\n`);
+      response.write(
+        `data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 30000, completion_tokens: 2000, total_tokens: 32000, prompt_cache_hit_tokens: 28000, prompt_cache_miss_tokens: 2000 } })}\n\n`,
+      );
+      response.write("data: [DONE]\n\n");
+      response.end();
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise<void>((resolve) => server.close(() => resolve())));
+  const address = server.address();
+  const port = typeof address === "object" && address ? address.port : 0;
+
+  // A hostname that is not loopback, redirected to the test server, so the
+  // client treats it as a real keyed endpoint.
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = ((url: string | URL | Request, init?: RequestInit) =>
+    realFetch(String(url).replace(`api.test.invalid:${port}`, `127.0.0.1:${port}`), init)) as typeof fetch;
+  t.after(() => {
+    globalThis.fetch = realFetch;
+  });
+
+  const app = await harness(t, {
+    config: { baseUrl: `http://api.test.invalid:${port}`, model: "deepseek-v4-flash" },
+  });
+  await app.start();
+  await settle(250); // the startup fetch is deliberately not awaited by run()
+
+  const first = await app.send("问题一", 600);
+  assert.match(first, /余额 ≈?[\d.]+ CNY/u, "the turn footer carries the remaining balance");
+
+  const status = await app.send("/status", 400);
+  assert.match(status, /余额\s+[\d.]+ CNY/u);
+  assert.ok(balanceCalls >= 2, `balance should refresh after a turn, saw ${balanceCalls} calls`);
+  await app.finish();
 });

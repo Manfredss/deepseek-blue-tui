@@ -141,6 +141,13 @@ export class DeepSeekTui {
   private homeScreenPristine = true;
   /** True while a slash command or a turn is running (no prompt is waiting). */
   private commandBusy = false;
+  /**
+   * Last known account balance, and what it cost to learn it. Refreshed after
+   * a turn rather than before, so it never delays a reply; between refreshes
+   * the estimated spend is subtracted locally so the figure keeps moving.
+   */
+  private balance: { currency: string; total: number; fetchedAt: number; estimated: boolean } | undefined;
+  private balanceFailed = false;
 
   constructor(options: TuiOptions) {
     this.configStore = options.configStore;
@@ -394,6 +401,7 @@ export class DeepSeekTui {
       this.session = await this.initialSession();
       await this.lockSession(this.session);
       this.homeScreenPristine = this.session.messages.length === 0 && !this.readOnly;
+      this.refreshBalance();
       this.renderHome();
 
       while (!this.exitRequested) {
@@ -842,6 +850,11 @@ export class DeepSeekTui {
         `${this.session.id.slice(0, 8)} ${this.theme.muted(`· ${oneLine(this.session.title, 200)}`)}${this.readOnly ? this.theme.yellow(" · 只读") : ""}`,
       ],
       ["凭据", `${maskApiKey(runtime.apiKey)}${fromEnvironment ? this.theme.muted(" · 来自环境变量") : ""}`],
+      [
+        "余额",
+        this.balanceLabel() ??
+          (this.balanceFailed ? this.theme.yellow("暂时无法查询") : this.theme.muted("查询中…")),
+      ],
       ["目录", shortenPath(this.cwd, Math.max(8, columns - 10), homedir())],
       ["DSH", formatDshStatus(dshStatus)],
     ];
@@ -1667,6 +1680,8 @@ export class DeepSeekTui {
     if (usage.completionTokens > 0) parts.push(`${(usage.completionTokens / seconds).toFixed(1)} tok/s`);
     const pricing = this.pricing();
     if (pricing) parts.push(`≈${formatCost(estimateCost(usage, pricing))}`);
+    const balance = this.balanceLabel();
+    if (balance) parts.push(`余额 ${balance}`);
     return parts.join(" · ");
   }
 
@@ -1751,8 +1766,11 @@ export class DeepSeekTui {
       const elapsedMs = Math.max(1, Date.now() - startedAt);
       this.session.lastTurnMs = elapsedMs;
       this.session.lastCompletionTokens = result.usage.completionTokens;
+      this.chargeBalance(result.usage);
       await this.saveSession();
       this.write(`\n\n${this.theme.muted(this.turnFooter(result.usage, elapsedMs))}\n\n`);
+      // Reconcile with the real figure for the next turn's footer.
+      this.refreshBalance();
     } catch (error) {
       spinner.stop();
       // Close a code fence the interrupted reply left open, or the frame
@@ -1839,6 +1857,62 @@ export class DeepSeekTui {
       this.line(this.theme.muted(`  ${this.session.model} 没有内置价目；可在 config.json 的 pricing 里补充后显示金额。`));
     }
     this.line(this.theme.muted("  提示：/compact 与切换模型都会让整段前缀失效。"));
+  }
+
+  /**
+   * Refreshes the account balance in the background. Never awaited by a turn:
+   * a slow balance endpoint must not hold up the next prompt, and a failure
+   * here is not worth an error — the figure simply stops being shown.
+   */
+  private refreshBalance(): void {
+    const runtime = this.configStore.runtime(this.config);
+    if (!runtime.apiKey) return;
+    void (async () => {
+      try {
+        const result = await getBalance({
+          apiKey: runtime.apiKey as string,
+          baseUrl: runtime.baseUrl,
+          timeoutMs: 8_000,
+        });
+        const first = result.balances[0];
+        if (!first) return;
+        const total = Number.parseFloat(first.totalBalance);
+        if (!Number.isFinite(total)) return;
+        this.balance = { currency: first.currency, total, fetchedAt: Date.now(), estimated: false };
+        this.balanceFailed = false;
+      } catch {
+        // A balance is a nicety; losing it must not disturb the session.
+        this.balanceFailed = true;
+      }
+    })();
+  }
+
+  /**
+   * Subtracts a turn's estimated cost locally, so the remaining figure moves
+   * with every message instead of only when the API is asked again. Marked
+   * estimated so the display never claims more precision than it has.
+   */
+  private chargeBalance(usage: TokenUsage): void {
+    const pricing = this.pricing();
+    if (!this.balance || !pricing) return;
+    const spent = estimateCost(usage, pricing);
+    if (!Number.isFinite(spent) || spent <= 0) return;
+    // Balance is billed in the account currency; USD rates only approximate
+    // it, so this is explicitly an estimate between real refreshes.
+    this.balance = { ...this.balance, total: Math.max(0, this.balance.total - spent), estimated: true };
+  }
+
+  /**
+   * `≈12.34 CNY`, or undefined when there is nothing trustworthy to show.
+   * Bare, so callers that already have a "余额" label do not repeat it; the
+   * leading ≈ marks a figure carried forward by local estimate rather than
+   * one just read from the API.
+   */
+  private balanceLabel(): string | undefined {
+    if (!this.balance) return undefined;
+    const { currency, total, estimated } = this.balance;
+    const amount = total >= 100 ? total.toFixed(0) : total.toFixed(2);
+    return `${estimated ? "≈" : ""}${amount} ${currency}`;
   }
 
   private errorMessage(error: unknown): string {
