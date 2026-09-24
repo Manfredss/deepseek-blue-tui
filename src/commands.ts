@@ -13,11 +13,16 @@ export const SLASH_COMMANDS = [
   "/thinking",
   "/effort",
   "/btw",
+  "/continue",
+  "/prefill",
   "/race",
   "/compact",
   "/export",
   "/edit",
   "/attach",
+  "/copy",
+  "/save",
+  "/diff",
   "/rewind",
   "/search",
   "/do",
@@ -51,13 +56,18 @@ export const SLASH_COMMAND_DEFINITIONS: readonly SlashCommandDefinition[] = [
   { command: "/context", description: "逐条消息的 token 审计与构成" },
   { command: "/cache", description: "上下文缓存命中率与花费估算" },
   { command: "/thinking", description: "显示或隐藏思考过程" },
-  { command: "/effort", description: "设置思考强度：low / high / max" },
+  { command: "/effort", description: "设置思考强度：low / high / max / auto" },
   { command: "/btw", description: "侧问：单轮提问，不写入会话" },
-  { command: "/race", description: "多个思考强度并行对比，保留一个" },
+  { command: "/continue", description: "接着写完被中断的那条回答" },
+  { command: "/prefill", description: "指定下一条回答的开头（只要代码等）" },
+  { command: "/race", description: "多档位/多模型并行对比，保留一个（--blind / stats）" },
   { command: "/compact", description: "把历史压缩成一条摘要" },
   { command: "/export", description: "把当前会话导出为 Markdown" },
   { command: "/edit", description: "用外部编辑器撰写下一条消息" },
   { command: "/attach", description: "附加一个文本文件并发送" },
+  { command: "/copy", description: "复制回答里的代码块到剪贴板" },
+  { command: "/save", description: "把代码块写入指定文件" },
+  { command: "/diff", description: "代码块与 /attach 过的原文比对" },
   { command: "/rewind", description: "从更早的消息分支出新会话" },
   { command: "/search", description: "在当前会话内全文搜索" },
   { command: "/do", description: "把任务交给 DSH 执行（会修改文件）" },
@@ -110,6 +120,33 @@ export function tokenizeArguments(input: string): string[] {
   if (escaped) current += "\\";
   if (current) tokens.push(current);
   return tokens;
+}
+
+export interface IndexedArgument {
+  /** A leading number, when the argument started with one. */
+  index?: string;
+  /** Everything after it, verbatim. */
+  rest: string;
+}
+
+/** Drops one matching pair of surrounding quotes, so a spaced path can be quoted. */
+function unquoteArgument(value: string): string {
+  const trimmed = value.trim();
+  return /^(["'])([\s\S]*)\1$/u.exec(trimmed)?.[2] ?? trimmed;
+}
+
+/**
+ * Splits `[n] <rest>` without tokenizing the remainder.
+ *
+ * `tokenizeArguments` reads `\` as an escape, which is right for quoted
+ * arguments and fatal for `C:\Users\me\out.py`. Commands whose remainder is a
+ * single path use this instead, so a Windows path survives being typed.
+ */
+export function splitIndexedArgument(args: string): IndexedArgument {
+  const trimmed = args.trim();
+  const match = /^(\d+)(?:\s+([\s\S]*))?$/u.exec(trimmed);
+  if (match?.[1] === undefined) return { rest: unquoteArgument(trimmed) };
+  return { index: match[1], rest: unquoteArgument(match[2] ?? "") };
 }
 
 export function parseSlashCommand(input: string): SlashCommand | undefined {
@@ -242,16 +279,21 @@ const COMMAND_HELP_ROWS: readonly (readonly [string, string])[] = [
   ["/resume [ID/标题]", "浏览或恢复历史会话（别名 /sessions）"],
   ["/rename <标题>", "重命名当前会话"],
   ["/thinking [on|off]", "显示或隐藏思考过程"],
-  ["/effort [low|high|max]", "设置模型思考强度（默认 high）"],
+  ["/effort [档位|auto]", "设置思考强度；auto 按 /race 账本自动选档"],
   ["/status", "模型、会话、凭据与 DSH 状态"],
   ["/context", "逐条消息的 token 估算与分段构成"],
   ["/cache", "缓存命中率、可复用前缀与花费估算"],
   ["/btw <问题>", "侧问：复用上下文单轮问答，不写入会话"],
-  ["/race [档位…] <问题>", "同一问题多档并行，按耗时/token/花费对比后保留一个"],
+  ["/continue", "接着写完被中断的那条回答（前缀续写，不重付思考）"],
+  ["/prefill <文本>", "指定下一条回答的开头，例如 /prefill ```python 只要代码"],
+  ["/race [分支…] <问题>", "同一问题多档/多模型并行对比，保留一个；--blind 盲测，stats 看账本"],
   ["/compact", "把历史压缩为一条摘要（自动导出备份）"],
   ["/export", "导出当前会话为 Markdown"],
   ["/edit [草稿]", "用 $VISUAL/$EDITOR 编写下一条消息"],
   ["/attach <路径>", "附加文本文件（≤256 KiB）并发送"],
+  ["/copy [编号]", "复制回答里的代码块到剪贴板（无本地工具时走 OSC 52）"],
+  ["/save [编号] <路径>", "把代码块写入文件（覆盖前确认）"],
+  ["/diff [编号] [路径]", "代码块与 /attach 过的原文逐行比对"],
   ["/rewind [编号]", "从更早的消息分支新会话（原会话保留）"],
   ["/search <关键词>", "在当前会话内全文搜索"],
   ["/do <任务>", "把任务交给 DSH 智能体执行，结果写回本会话（别名 /agent）"],

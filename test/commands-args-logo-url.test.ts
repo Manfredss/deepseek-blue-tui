@@ -9,6 +9,7 @@ import {
   commandHelp,
   completeSlashCommand,
   parseSlashCommand,
+  splitIndexedArgument,
   tokenizeArguments,
   unescapePrompt,
 } from "../src/commands.js";
@@ -23,6 +24,24 @@ test("tokenizeArguments supports whitespace, quotes, and escaping", () => {
   );
   assert.deepEqual(tokenizeArguments("  'unterminated value  "), ["unterminated value"]);
   assert.deepEqual(tokenizeArguments(""), []);
+});
+
+test("an indexed argument keeps its path exactly as typed", () => {
+  // The whole point: `\` is an escape to the tokenizer and a separator on
+  // Windows, so a path argument must never go through it.
+  assert.deepEqual(splitIndexedArgument(String.raw`1 C:\Users\me\out.py`), {
+    index: "1",
+    rest: String.raw`C:\Users\me\out.py`,
+  });
+  assert.deepEqual(splitIndexedArgument("out.py"), { rest: "out.py" });
+  assert.deepEqual(splitIndexedArgument("  2   src/app.ts  "), { index: "2", rest: "src/app.ts" });
+  assert.deepEqual(splitIndexedArgument("3"), { index: "3", rest: "" });
+  assert.deepEqual(splitIndexedArgument(""), { rest: "" });
+  // A path with spaces can be quoted, and only the outer pair is dropped.
+  assert.deepEqual(splitIndexedArgument('1 "my file.py"'), { index: "1", rest: "my file.py" });
+  assert.deepEqual(splitIndexedArgument("~/notes/a b.md"), { rest: "~/notes/a b.md" });
+  // A leading number that is part of the name is not an index.
+  assert.deepEqual(splitIndexedArgument("2024-notes.md"), { rest: "2024-notes.md" });
 });
 
 test("parseSlashCommand normalizes the name and preserves raw arguments", () => {
