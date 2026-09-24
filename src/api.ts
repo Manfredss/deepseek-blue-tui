@@ -41,6 +41,13 @@ export interface StreamChatOptions {
   timeoutMs?: number;
   /** DeepSeek V4 thinking effort (OpenAI format: low/high/max). */
   effort?: ReasoningEffort;
+  /**
+   * Continue the final assistant message instead of answering after it.
+   * Requires the beta base URL — see `prefixBaseUrl`.
+   */
+  prefixContinuation?: boolean;
+  /** Stop sequences, e.g. ["```"] to end a forced code fence. */
+  stop?: string[];
   fetchImpl?: typeof fetch;
   onContent?: (delta: string) => void;
   onReasoning?: (delta: string) => void;
@@ -71,15 +78,52 @@ function parseUsage(value: unknown): TokenUsage {
   };
 }
 
-function apiMessages(messages: ChatMessage[]): Record<string, string>[] {
-  return messages.map((message) => {
-    const result: Record<string, string> = { role: message.role, content: message.content };
+function apiMessages(messages: ChatMessage[], prefixContinuation = false): Record<string, unknown>[] {
+  return messages.map((message, index) => {
+    const result: Record<string, unknown> = { role: message.role, content: message.content };
     // DeepSeek thinking models require this field to be echoed on later turns.
     if (message.role === "assistant" && message.reasoningContent) {
       result.reasoning_content = message.reasoningContent;
     }
+    // Prefix completion: the trailing assistant message is the start of the
+    // answer to finish, not a finished turn to reply after.
+    if (prefixContinuation && index === messages.length - 1 && message.role === "assistant") {
+      result.prefix = true;
+    }
     return result;
   });
+}
+
+/** The official endpoint, whose `/beta` path carries prefix completion. */
+const OFFICIAL_API_HOST = "api.deepseek.com";
+
+export function isOfficialEndpoint(baseUrl: string): boolean {
+  try {
+    return new URL(baseUrl).hostname.toLowerCase() === OFFICIAL_API_HOST;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Where prefix completion has to be sent.
+ *
+ * DeepSeek exposes it only under `https://api.deepseek.com/beta`. A custom
+ * OpenAI-compatible gateway is left exactly as configured: inventing a `/beta`
+ * path it does not serve would turn a working endpoint into a 404, and a
+ * gateway that does proxy the feature already accepts it on its normal path.
+ */
+export function prefixBaseUrl(baseUrl: string): string {
+  const trimmed = baseUrl.replace(/\/+$/, "");
+  if (!isOfficialEndpoint(trimmed)) return trimmed;
+  try {
+    // From the origin, not by appending: the official endpoint is documented
+    // both as `api.deepseek.com` and as `api.deepseek.com/v1`, and appending
+    // to the latter gives `/v1/beta`, which is a 404 rather than a feature.
+    return `${new URL(trimmed).origin}/beta`;
+  } catch {
+    return trimmed;
+  }
 }
 
 export async function* parseSse(body: ReadableStream<Uint8Array>): AsyncGenerator<string> {
@@ -224,12 +268,13 @@ export async function streamChat(options: StreamChatOptions): Promise<StreamChat
       },
       body: JSON.stringify({
         model: options.model,
-        messages: apiMessages(options.messages),
+        messages: apiMessages(options.messages, options.prefixContinuation),
         stream: true,
         stream_options: { include_usage: true },
         // DeepSeek V4 thinking effort: low/high/max. Thinking mode itself is
         // enabled by default, so only the effort level needs to be sent.
         ...(options.effort !== undefined ? { reasoning_effort: options.effort } : {}),
+        ...(options.stop && options.stop.length > 0 ? { stop: options.stop } : {}),
       }),
     }, controller.signal);
     if (!response.ok) throw await errorFromResponse(response);
