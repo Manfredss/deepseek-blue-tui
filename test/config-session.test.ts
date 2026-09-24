@@ -59,6 +59,7 @@ test("normalizeConfig trims valid values and sanitizes invalid fields", () => {
       dshPort: 65_535,
       contextLimitTokens: 200_000,
       effort: "low",
+      effortAuto: true,
     }),
     {
       version: 1,
@@ -69,8 +70,12 @@ test("normalizeConfig trims valid values and sanitizes invalid fields", () => {
       dshPort: 65_535,
       contextLimitTokens: 200_000,
       effort: "low",
+      effortAuto: true,
     },
   );
+
+  // A non-boolean auto flag falls back to the default rather than going truthy.
+  assert.equal(normalizeConfig({ effortAuto: "yes" }).effortAuto, false);
 
   assert.deepEqual(
     normalizeConfig({ model: " ", baseUrl: "file:///tmp/socket", apiKey: " ", dshPort: 0, contextLimitTokens: 100 }),
@@ -93,6 +98,7 @@ test("ConfigStore round-trips normalized configuration and supplies defaults", a
     dshPort: 4444,
     contextLimitTokens: 256_000,
     effort: "max",
+    effortAuto: false,
   });
 
   assert.deepEqual(await store.load(), {
@@ -104,6 +110,7 @@ test("ConfigStore round-trips normalized configuration and supplies defaults", a
     dshPort: 4444,
     contextLimitTokens: 256_000,
     effort: "max",
+    effortAuto: false,
   });
   const serialized = await readFile(store.configPath, "utf8");
   assert.equal(serialized.endsWith("\n"), true);

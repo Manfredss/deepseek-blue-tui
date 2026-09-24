@@ -52,6 +52,8 @@ export interface AppConfig {
   contextLimitTokens: number;
   /** DeepSeek V4 thinking effort (OpenAI format: low/high/max). */
   effort: ReasoningEffort;
+  /** Pick the effort per question from the `/race` ledger, falling back to `effort`. */
+  effortAuto: boolean;
   /** Per-model USD/1M-token overrides; published defaults go stale. */
   pricing?: Record<string, { cacheHit: number; cacheMiss: number; output: number }>;
 }
@@ -80,6 +82,7 @@ export const DEFAULT_CONFIG: AppConfig = {
   dshPort: 3080,
   contextLimitTokens: 131_072,
   effort: "high",
+  effortAuto: false,
 };
 
 export const RECOMMENDED_MODELS = [
