@@ -1,6 +1,6 @@
 import { homedir, userInfo } from "node:os";
-import { join } from "node:path";
-import { appendFile, readFile, writeFile } from "node:fs/promises";
+import { isAbsolute, join, relative as relativePath } from "node:path";
+import { appendFile, readFile, stat, writeFile } from "node:fs/promises";
 import type { AppConfig, ChatMessage, ReasoningEffort, Session, TokenUsage } from "./types.js";
 import { EMPTY_USAGE, REASONING_EFFORT_LABELS, REASONING_EFFORTS, RECOMMENDED_MODELS } from "./types.js";
 import { ConfigStore, maskApiKey } from "./config.js";
@@ -19,6 +19,7 @@ import {
   buildContextBreakdown,
   COMPACT_INSTRUCTION,
   editPrompt,
+  expandUserPath,
   forkSessionAt,
   formatCompactTokens,
   readAttachmentFile,
@@ -31,6 +32,7 @@ import { ensurePrivateDirectory } from "./fs-utils.js";
 import {
   closestCommands,
   commandHelp,
+  splitIndexedArgument,
   parseSlashCommand,
   renderSlashCommandMenu,
   slashCommandSuggestions,
@@ -39,13 +41,34 @@ import {
 import { colorEnabled, createTheme, type Theme } from "./theme.js";
 import { renderWelcomeScreen } from "./logo.js";
 import { LineInput, promptSecret, MenuPicker, watchAbortKeys, type MenuPickerOptions, type MenuPickerResult } from "./input.js";
-import { DeepSeekApiError, getBalance, streamChat } from "./api.js";
+import { DeepSeekApiError, getBalance, isOfficialEndpoint, prefixBaseUrl, streamChat } from "./api.js";
+import { applyPrefill, planPrefill, type PrefillPlan } from "./prefill.js";
+import {
+  classifyQuestion,
+  parseRaceArgs,
+  QUESTION_KIND_LABELS,
+  RaceLedger,
+  recommendEffort,
+  summarize,
+  type RaceBranch,
+  type RaceBranchRecord,
+  type RaceRecord,
+} from "./race.js";
 import { DEEPSEEK_URLS, openUrl } from "./open-url.js";
 import { DshManager, formatDshStatus, installDsh } from "./dsh.js";
 import { LockHeldError } from "./fs-utils.js";
 import { renderContextHud, renderContextReport, renderPressureBar } from "./context-view.js";
 import { Spinner } from "./spinner.js";
-import { MarkdownStream, renderMarkdown } from "./markdown.js";
+import {
+  extractCodeBlocks,
+  isOutputBlock,
+  MarkdownStream,
+  renderMarkdown,
+  renderMarkdownWithBlocks,
+  type CodeBlock,
+} from "./markdown.js";
+import { clipboardCommand, osc52, OSC52_MAX_BYTES, writeClipboard } from "./clipboard.js";
+import { diffLines, looksLikeEdit, renderDiff, summarizeDiff } from "./diff.js";
 import { cacheReport, estimateCost, formatCost, prefixLoss, pricingFor, type ModelPricing } from "./pricing.js";
 import { clipToWidth, padToWidth, shortenPath } from "./text-width.js";
 import { VERSION } from "./version.js";
@@ -63,6 +86,79 @@ export interface TuiOptions {
   color?: boolean;
   input?: NodeJS.ReadableStream;
   output?: NodeJS.WriteStream;
+}
+
+/** Everything a request needs from the resolved runtime config. */
+interface Credentials {
+  apiKey: string;
+  baseUrl: string;
+}
+
+interface AssistantTurnOptions {
+  credentials: Credentials;
+  model: string;
+  messages: ChatMessage[];
+  effort: ReasoningEffort;
+  /** Finish the trailing assistant message rather than reply after it. */
+  prefixContinuation?: boolean;
+  /** Answer text already decided: a prefill, or the half already generated. */
+  echo?: string;
+  stop?: string[];
+  /** Spinner verb; defaults to 正在思考. */
+  label?: string;
+  /** First code-block number this answer may use. */
+  numberFrom: number;
+}
+
+interface AssistantTurn {
+  /** What the model returned this time; excludes any `echo`. */
+  content: string;
+  reasoning: string;
+  usage: TokenUsage;
+  elapsedMs: number;
+  /** Code blocks this answer drew, including any that came from an `echo`. */
+  blocks: readonly CodeBlock[];
+  /** Whether the `echo` was actually redrawn; false when nothing streamed. */
+  echoed: boolean;
+  /** Set when the stream failed or was interrupted; `content` may be partial. */
+  error?: unknown;
+}
+
+/** A code block plus which answer it came from, so siblings can be named. */
+interface SessionBlock extends CodeBlock {
+  answer: number;
+}
+
+/** One branch of a `/race`: its answer and what it cost to get it. */
+interface RaceEntry {
+  branch: RaceBranch;
+  content: string;
+  reasoning: string;
+  usage: TokenUsage;
+  elapsedMs: number;
+  error?: string;
+}
+
+/** Fisher–Yates, so a blind comparison cannot be read off the row order. */
+function shuffledIndexes(count: number): number[] {
+  const indexes = Array.from({ length: count }, (_value, index) => index);
+  for (let index = indexes.length - 1; index > 0; index -= 1) {
+    const swap = Math.floor(Math.random() * (index + 1));
+    [indexes[index], indexes[swap]] = [indexes[swap] as number, indexes[index] as number];
+  }
+  return indexes;
+}
+
+/** How many attached files stay diffable; older ones are forgotten. */
+const ATTACHMENT_MEMORY = 8;
+
+async function fileExists(path: string): Promise<boolean> {
+  try {
+    await stat(path);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 const HISTORY_LIMIT = 500;
@@ -134,11 +230,23 @@ export class DeepSeekTui {
   private interruptArmedAt = 0;
   private readonly historyPath: string;
   private history: string[] = [];
+  /** Every `/race` the user has judged; the evidence behind `/effort auto`. */
+  private readonly races: RaceLedger;
+  private raceRecords: RaceRecord[] | undefined;
+  private autoEffortNoted = false;
   private processInterrupt: () => void;
   private sessionLock: FileLock | undefined;
   private readOnly = false;
   private mainPromptActive = false;
   private homeScreenPristine = true;
+  /** Text the next answer must start with; consumed by the next turn. */
+  private prefill: PrefillPlan | undefined;
+  /** Code blocks drawn in this session, numbered so `/copy 2` can name one. */
+  private codeBlocks: SessionBlock[] = [];
+  /** Counts answers, so blocks from one reply can be told from another's. */
+  private answers = 0;
+  /** Files `/attach` has read, kept so an edited version can be diffed. */
+  private readonly attachments = new Map<string, string>();
   /** True while a slash command or a turn is running (no prompt is waiting). */
   private commandBusy = false;
   /**
@@ -163,6 +271,7 @@ export class DeepSeekTui {
     this.resumeQuery = options.resumeQuery;
     this.continueLast = options.continueLast ?? false;
     this.historyPath = join(this.configStore.home, "history");
+    this.races = new RaceLedger(join(this.configStore.home, "races.jsonl"));
     this.processInterrupt = () => this.handleInterrupt();
   }
 
@@ -446,6 +555,16 @@ export class DeepSeekTui {
 
   private renderHistory(session: Session): void {
     this.line(this.theme.muted(`恢复会话 ${session.id.slice(0, 8)} · ${session.title}`));
+    // Numbering is rebuilt from the *full* answers, not from the shortened
+    // preview below: /copy must hand back the code that was written, not the
+    // part of it that happened to fit on screen.
+    this.codeBlocks = [];
+    this.answers = 0;
+    for (const message of session.messages) {
+      if (message.role !== "assistant") continue;
+      const blocks = extractCodeBlocks(message.content, this.codeBlocks.length + 1);
+      if (blocks.length > 0) this.fileBlocks(blocks);
+    }
     const messages = session.messages.slice(-10);
     if (session.messages.length > messages.length) {
       this.line(this.theme.muted(`… 已省略更早的 ${session.messages.length - messages.length} 条消息`));
@@ -573,6 +692,12 @@ export class DeepSeekTui {
       case "btw":
         await this.sideQuestion(args);
         break;
+      case "continue":
+        await this.continueAnswer();
+        break;
+      case "prefill":
+        this.prefillNext(args);
+        break;
       case "race":
         await this.raceEfforts(args);
         break;
@@ -587,6 +712,15 @@ export class DeepSeekTui {
         break;
       case "attach":
         await this.attachFile(args);
+        break;
+      case "copy":
+        await this.copyCodeBlock(tokens[0]);
+        break;
+      case "save":
+        await this.saveCodeBlock(args);
+        break;
+      case "diff":
+        this.showDiff(args);
         break;
       case "rewind":
         await this.rewindConversation(tokens[0]);
@@ -731,6 +865,9 @@ export class DeepSeekTui {
     if (!this.session) return;
     if (this.session.messages.length > 0) await this.saveSession();
     this.session = createSession(this.cwd, this.session.model);
+    this.codeBlocks = [];
+    this.answers = 0;
+    this.prefill = undefined;
     await this.lockSession(this.session);
     this.clearScreen(true);
     this.renderHome();
@@ -754,6 +891,9 @@ export class DeepSeekTui {
     await this.lockSession(selected);
     this.renderHistory(selected);
     this.line(`${this.theme.green("✓")} 已恢复；当前模型 ${selected.model}`);
+    if (this.codeBlocks.length > 0) {
+      this.line(this.theme.muted(`（历史里有 ${this.codeBlocks.length} 个代码块，/copy 或 /save 可直接取用）`));
+    }
   }
 
   private async renameConversation(title: string): Promise<void> {
@@ -784,33 +924,65 @@ export class DeepSeekTui {
     this.line(`思考过程：${this.config.showReasoning ? this.theme.green("显示") : this.theme.muted("隐藏")}`);
   }
 
-  /** /effort — DeepSeek V4 thinking effort (low/high/max), with a menu. */
+  /** /effort — DeepSeek V4 thinking effort (low/high/max, or auto), with a menu. */
   private async changeEffort(requested: string | undefined): Promise<void> {
     const normalized = requested?.trim().toLocaleLowerCase();
+    const AUTO = "auto";
     let effort: ReasoningEffort | undefined;
+    if (normalized === AUTO) {
+      await this.enableAutoEffort();
+      return;
+    }
     if (normalized && (REASONING_EFFORTS as readonly string[]).includes(normalized)) {
       effort = normalized as ReasoningEffort;
     } else if (normalized) {
-      this.line(this.theme.yellow("用法：/effort [low|high|max]。medium 在 DeepSeek V4 上会映射为 high。"));
+      this.line(this.theme.yellow("用法：/effort [low|high|max|auto]。medium 在 DeepSeek V4 上会映射为 high。"));
       return;
     } else {
       const result = await this.runMenu({
         title: "选择思考强度",
-        items: REASONING_EFFORTS.map(
-          (level) =>
-            `${level.padEnd(4)} ${REASONING_EFFORT_LABELS[level]}${this.config.effort === level ? " ✓" : ""}`,
-        ),
+        items: [
+          ...REASONING_EFFORTS.map(
+            (level) =>
+              `${level.padEnd(4)} ${REASONING_EFFORT_LABELS[level]}${!this.config.effortAuto && this.config.effort === level ? " ✓" : ""}`,
+          ),
+          `${AUTO.padEnd(4)} 按 /race 对比过的结果自动选档${this.config.effortAuto ? " ✓" : ""}`,
+        ],
         footer: "↑/↓ 选择 · Enter 确认 · Esc 取消 · 数字跳转",
       });
       if (!result || result.kind !== "index") return;
+      if (result.index >= REASONING_EFFORTS.length) {
+        await this.enableAutoEffort();
+        return;
+      }
       effort = REASONING_EFFORTS[result.index];
     }
     if (!effort) return;
     this.config.effort = effort;
+    this.config.effortAuto = false;
     await this.configStore.save(this.config);
     this.line(
       `${this.theme.green("✓")} 思考强度已设为 ${this.theme.bold(effort)} ${this.theme.muted(`· ${REASONING_EFFORT_LABELS[effort]}`)}`,
     );
+  }
+
+  /**
+   * Hands the effort knob to the ledger `/race` has been filling. The
+   * configured level stays as the fallback for questions the records have
+   * nothing to say about.
+   */
+  private async enableAutoEffort(): Promise<void> {
+    this.config.effortAuto = true;
+    await this.configStore.save(this.config);
+    const records = await this.raceHistory();
+    this.line(
+      `${this.theme.green("✓")} 思考强度已设为 ${this.theme.bold("auto")} ${this.theme.muted(`· 按 /race 的对比结果选档，没有依据时用 ${this.config.effort}`)}`,
+    );
+    if (records.length === 0) {
+      this.line(this.theme.muted("目前还没有对比记录：先跑几次 /race low max <问题>，auto 才有依据。"));
+      return;
+    }
+    this.line(this.theme.muted(`已有 ${records.length} 次对比记录 · /race stats 查看`));
   }
 
   /** /status — one aligned panel: model, session, credentials, DSH. */
@@ -834,8 +1006,17 @@ export class DeepSeekTui {
       ["模型", `${this.theme.bold(this.session.model)} ${this.theme.muted(`· ${runtime.baseUrl}`)}`],
       [
         "思考",
-        `${this.theme.bold(this.config.effort)} ${this.theme.muted(`· ${REASONING_EFFORT_LABELS[this.config.effort]} · 过程${this.config.showReasoning ? "显示" : "隐藏"}`)}`,
+        `${this.theme.bold(this.config.effortAuto ? "auto" : this.config.effort)} ${this.theme.muted(
+          `· ${
+            this.config.effortAuto
+              ? `按 /race 账本选档，无依据时 ${this.config.effort}`
+              : REASONING_EFFORT_LABELS[this.config.effort]
+          } · 过程${this.config.showReasoning ? "显示" : "隐藏"}`,
+        )}`,
       ],
+      ...(this.prefill
+        ? ([["前缀", `${oneLine(this.prefill.label, 60)} ${this.theme.muted("· 仅下一条回答")}`]] as const)
+        : []),
       [
         "上下文",
         `${contextPercent} ${renderPressureBar(this.theme, percent)} ${formatCompactTokens(estimated)}/${formatCompactTokens(limit)} ${this.theme.muted(`· ${this.session.messages.length} 条消息`)}`,
@@ -1038,85 +1219,82 @@ export class DeepSeekTui {
    */
   private async raceEfforts(args: string): Promise<void> {
     if (!this.session) return;
-    const tokens = args.trim().split(/\s+/u).filter(Boolean).map((value) => value.toLocaleLowerCase());
-    const efforts = tokens.filter((token): token is ReasoningEffort =>
-      (REASONING_EFFORTS as readonly string[]).includes(token),
-    );
-    const prompt = tokens.filter((token) => !(REASONING_EFFORTS as readonly string[]).includes(token)).join(" ");
-    const levels = efforts.length >= 2 ? [...new Set(efforts)] : [...REASONING_EFFORTS];
-    if (efforts.length === 1) {
+    const parsed = parseRaceArgs(args, { model: this.session.model, effort: this.config.effort });
+    if (parsed.stats) {
+      await this.showRaceStats();
+      return;
+    }
+    if (parsed.branches.length === 1) {
       this.line(this.theme.yellow("至少要两个档位才能对比，例如 /race low max 你的问题"));
       return;
     }
+    const model = this.session.model;
+    const branches: RaceBranch[] =
+      parsed.branches.length >= 2
+        ? parsed.branches
+        : REASONING_EFFORTS.map((effort) => ({ model, effort, label: effort }));
     // The question can also just be the last thing already asked.
-    const question = prompt.trim() || this.lastUserMessage();
+    const question = parsed.question.trim() || this.lastUserMessage();
     if (!question) {
-      this.line(this.theme.yellow("用法：/race [low high max] <问题>。不带问题时复用上一条用户消息。"));
+      this.line(this.theme.yellow("用法：/race [low high max | pro@max] [--blind] <问题>。不带问题时复用上一条用户消息。"));
       return;
     }
-    const runtime = this.configStore.runtime(this.config);
-    if (!runtime.apiKey) {
-      this.line(this.theme.yellow("缺少 API Key。请先输入 /login，或设置 DEEPSEEK_API_KEY。"));
-      return;
-    }
+    const credentials = this.requireCredentials();
+    if (!credentials) return;
 
     const request = this.requestMessages([
       ...this.session.messages,
       { role: "user", content: question, createdAt: new Date().toISOString() },
     ]);
-    this.line(this.theme.bold(`并行对比 ${levels.join(" / ")}`));
+    this.line(
+      this.theme.bold(
+        parsed.blind
+          ? `并行对比 ${branches.length} 个分支（盲测：选完才揭晓）`
+          : `并行对比 ${branches.map((branch) => branch.label).join(" / ")}`,
+      ),
+    );
     this.line(this.theme.muted(`  ${oneLine(question, 200)}`));
 
     const controller = new AbortController();
     this.controller = controller;
     const generationGuard = this.beginGenerationGuard();
-    const done = new Set<ReasoningEffort>();
+    let done = 0;
     const spinner = new Spinner(this.output, (frame, elapsedMs) =>
       clipToWidth(
-        `${this.theme.blue(frame)} ${this.theme.muted(`并行生成中… (${String(Math.max(0, Math.round(elapsedMs / 1_000)))}s · 已完成 ${done.size}/${levels.length} · esc 中断)`)}`,
+        `${this.theme.blue(frame)} ${this.theme.muted(`并行生成中… (${String(Math.max(0, Math.round(elapsedMs / 1_000)))}s · 已完成 ${done}/${branches.length} · esc 中断)`)}`,
         this.terminalColumns(),
       ),
     );
     this.write("\n");
     spinner.start();
-    const pricing = this.pricing();
-
-    interface RaceEntry {
-      effort: ReasoningEffort;
-      content: string;
-      reasoning: string;
-      usage: TokenUsage;
-      elapsedMs: number;
-      error?: string;
-    }
 
     try {
       const results = await Promise.all(
-        levels.map(async (effort): Promise<RaceEntry> => {
+        branches.map(async (branch): Promise<RaceEntry> => {
           const startedAt = Date.now();
           try {
             const result = await streamChat({
-              apiKey: runtime.apiKey as string,
-              baseUrl: runtime.baseUrl,
-              model: this.session?.model ?? this.config.model,
+              apiKey: credentials.apiKey,
+              baseUrl: credentials.baseUrl,
+              model: branch.model,
               messages: request,
-              effort,
+              effort: branch.effort,
               signal: controller.signal,
             });
-            done.add(effort);
+            done += 1;
             spinner.refresh();
             return {
-              effort,
+              branch,
               content: result.content,
               reasoning: result.reasoningContent,
               usage: result.usage,
               elapsedMs: Math.max(1, Date.now() - startedAt),
             };
           } catch (error) {
-            done.add(effort);
+            done += 1;
             spinner.refresh();
             return {
-              effort,
+              branch,
               content: "",
               reasoning: "",
               usage: { ...EMPTY_USAGE },
@@ -1133,28 +1311,42 @@ export class DeepSeekTui {
       generationGuard.detach();
       this.controller = undefined;
 
+      // Blind mode also shuffles: with the rows in the order they were asked
+      // for, "the slow expensive one" is still the last line every time.
+      const order = parsed.blind ? shuffledIndexes(results.length) : results.map((_, index) => index);
+      const named = order.flatMap((index, position) => {
+        const entry = results[index];
+        if (!entry) return [];
+        return [{ entry, name: parsed.blind ? String.fromCodePoint(65 + position) : entry.branch.label }];
+      });
+      const priced = (entry: RaceEntry): ModelPricing | undefined =>
+        pricingFor(entry.branch.model, this.config.pricing);
+      const anyPriced = named.some(({ entry }) => priced(entry) !== undefined);
+      const nameWidth = Math.max(6, ...named.map(({ name }) => name.length + 2));
+
       const columns = this.terminalColumns();
       this.line(this.theme.bold("对比"));
       this.line(
         this.theme.muted(
-          `  ${padToWidth("档位", 6)}${padToWidth("耗时", 9)}${padToWidth("输出", 8)}${padToWidth("思考", 8)}${pricing ? padToWidth("花费", 10) : ""}摘要`,
+          `  ${padToWidth(parsed.blind ? "分支" : "档位", nameWidth)}${padToWidth("耗时", 9)}${padToWidth("输出", 8)}${padToWidth("思考", 8)}${anyPriced ? padToWidth("花费", 10) : ""}摘要`,
         ),
       );
-      for (const entry of results) {
+      for (const { entry, name } of named) {
         if (entry.error) {
-          this.line(`  ${this.theme.bold(padToWidth(entry.effort, 6))}${this.theme.red(`失败：${entry.error}`)}`);
+          this.line(`  ${this.theme.bold(padToWidth(name, nameWidth))}${this.theme.red(`失败：${entry.error}`)}`);
           continue;
         }
-        const cost = pricing ? padToWidth(`≈${formatCost(estimateCost(entry.usage, pricing))}`, 10) : "";
+        const rates = priced(entry);
+        const cost = anyPriced ? padToWidth(rates ? `≈${formatCost(estimateCost(entry.usage, rates))}` : "—", 10) : "";
         this.line(
           clipToWidth(
-            `  ${this.theme.bold(padToWidth(entry.effort, 6))}${padToWidth(`${(entry.elapsedMs / 1_000).toFixed(1)}s`, 9)}${padToWidth(formatCompactTokens(entry.usage.completionTokens), 8)}${padToWidth(formatCompactTokens(entry.usage.reasoningTokens), 8)}${cost}${this.theme.muted(oneLine(entry.content, 200))}`,
+            `  ${this.theme.bold(padToWidth(name, nameWidth))}${padToWidth(`${(entry.elapsedMs / 1_000).toFixed(1)}s`, 9)}${padToWidth(formatCompactTokens(entry.usage.completionTokens), 8)}${padToWidth(formatCompactTokens(entry.usage.reasoningTokens), 8)}${cost}${this.theme.muted(oneLine(entry.content, 200))}`,
             columns,
           ),
         );
       }
 
-      const usable = results.filter((entry) => !entry.error && entry.content.trim());
+      const usable = named.filter(({ entry }) => !entry.error && entry.content.trim());
       if (usable.length === 0) {
         this.line(this.theme.yellow("没有可用的回答，会话未改变。"));
         return;
@@ -1163,8 +1355,8 @@ export class DeepSeekTui {
       const choice = await this.runMenu({
         title: "查看并保留哪一个？（其余丢弃，不写入会话）",
         items: usable.map(
-          (entry) =>
-            `${entry.effort.padEnd(5)} ${(entry.elapsedMs / 1_000).toFixed(1)}s  ${oneLine(entry.content, 160)}`,
+          ({ entry, name }) =>
+            `${name.padEnd(6)} ${(entry.elapsedMs / 1_000).toFixed(1)}s  ${oneLine(entry.content, 160)}`,
         ),
         footer: "↑/↓ 选择 · Enter 保留 · Esc 全部丢弃 · 数字跳转",
       });
@@ -1172,11 +1364,15 @@ export class DeepSeekTui {
         this.line(this.theme.muted("已全部丢弃，会话未改变。"));
         return;
       }
-      const kept = usable[choice.index];
-      if (!kept) return;
+      const picked = usable[choice.index];
+      if (!picked) return;
+      const kept = picked.entry;
+      if (parsed.blind) {
+        this.line(`${this.theme.muted("揭晓：")}${this.theme.bold(picked.name)} = ${this.theme.bold(kept.branch.label)}`);
+      }
 
-      this.write(`\n${this.theme.blue(`◆ DeepSeek (${kept.effort})`)}\n`);
-      this.line(renderMarkdown(kept.content, this.theme));
+      this.write(`\n${this.theme.blue(`◆ DeepSeek (${kept.branch.label})`)}\n`);
+      this.line(this.renderAnswer(kept.content));
 
       const now = new Date().toISOString();
       this.session.messages.push({ role: "user", content: question, createdAt: now });
@@ -1189,8 +1385,9 @@ export class DeepSeekTui {
       this.session.lastCompletionTokens = kept.usage.completionTokens;
       if (this.session.title === "New conversation") this.session.title = deriveTitle(question);
       await this.saveSession();
-      this.write(`\n${this.theme.muted(`已保留 ${kept.effort} 的回答 · ${this.turnFooter(kept.usage, kept.elapsedMs)}`)}\n`);
+      this.write(`\n${this.theme.muted(`已保留 ${kept.branch.label} 的回答 · ${this.turnFooter(kept.usage, kept.elapsedMs)}`)}\n`);
       this.line(this.theme.muted(`（其余 ${results.length - 1} 个分支同样计费，已计入会话累计）`));
+      await this.recordRace(question, results.map((entry) => ({ entry, chosen: entry === kept })));
       this.line();
     } catch (error) {
       spinner.stop();
@@ -1201,6 +1398,113 @@ export class DeepSeekTui {
       generationGuard.detach();
       this.controller = undefined;
     }
+  }
+
+  /**
+   * Files a judged race. That pick is the only labelled data this client can
+   * collect — "for this kind of question, that effort was worth its price" —
+   * but writing it must never cost the user the answer they just chose.
+   */
+  private async recordRace(question: string, entries: { entry: RaceEntry; chosen: boolean }[]): Promise<void> {
+    const shape = classifyQuestion(question);
+    const record: RaceRecord = {
+      version: 1,
+      at: new Date().toISOString(),
+      kind: shape.kind,
+      size: shape.size,
+      branches: entries.map(({ entry, chosen }): RaceBranchRecord => {
+        const rates = pricingFor(entry.branch.model, this.config.pricing);
+        return {
+          model: entry.branch.model,
+          effort: entry.branch.effort,
+          ms: entry.elapsedMs,
+          outputTokens: entry.usage.completionTokens,
+          reasoningTokens: entry.usage.reasoningTokens,
+          ...(rates && !entry.error ? { cost: estimateCost(entry.usage, rates) } : {}),
+          ...(chosen ? { chosen: true } : {}),
+          ...(entry.error ? { failed: true } : {}),
+        };
+      }),
+    };
+    // Read before writing: loading afterwards would see the appended line and
+    // then count it twice.
+    const history = await this.raceHistory();
+    try {
+      await this.races.append(record);
+    } catch {
+      return;
+    }
+    history.push(record);
+    const seen = history.filter((item) => item.kind === record.kind).length;
+    const hint = this.config.effortAuto ? "auto 会用上它" : "/effort auto 可按它自动选档";
+    this.line(this.theme.muted(`已记入对比账本（${QUESTION_KIND_LABELS[record.kind]} · 第 ${seen} 次）；${hint}。`));
+  }
+
+  /** /race stats — what the ledger has learned so far. */
+  private async showRaceStats(): Promise<void> {
+    const records = await this.raceHistory();
+    if (records.length === 0) {
+      this.line(this.theme.yellow("还没有对比记录。跑几次 /race low max <问题>，账本才会开始积累。"));
+      return;
+    }
+    const columns = this.terminalColumns();
+    this.line(this.theme.bold(`对比账本 · ${records.length} 次`));
+    this.line(
+      this.theme.muted(
+        `  ${padToWidth("类型", 10)}${padToWidth("次数", 6)}${REASONING_EFFORTS.map((effort) => padToWidth(effort, 10)).join("")}`,
+      ),
+    );
+    for (const summary of summarize(records)) {
+      const cells = REASONING_EFFORTS.map((effort) =>
+        padToWidth(
+          summary.appearances[effort] === 0 ? "—" : `${summary.wins[effort]}/${summary.appearances[effort]}`,
+          10,
+        ),
+      ).join("");
+      this.line(
+        clipToWidth(
+          `  ${padToWidth(QUESTION_KIND_LABELS[summary.kind], 10)}${padToWidth(String(summary.races), 6)}${cells}`,
+          columns,
+        ),
+      );
+    }
+    this.line(this.theme.muted("  单元格是「胜出 / 参与」，胜出即对比后你保留的那个分支。"));
+    this.line(
+      this.theme.muted(
+        `  ${this.config.effortAuto ? "/effort auto 正在使用这份账本" : "/effort auto 可按它自动选档"} · ${this.races.path}`,
+      ),
+    );
+  }
+
+  /** The race ledger, read once per session and kept in step with new races. */
+  private async raceHistory(): Promise<RaceRecord[]> {
+    if (!this.raceRecords) this.raceRecords = await this.races.load();
+    return this.raceRecords;
+  }
+
+  /**
+   * The effort one turn should use. With auto on, the ledger decides and says
+   * why; a question the records cannot speak to keeps the configured level.
+   */
+  private async effortFor(question: string): Promise<ReasoningEffort> {
+    if (!this.config.effortAuto) return this.config.effort;
+    const shape = classifyQuestion(question);
+    const advice = recommendEffort(await this.raceHistory(), shape, this.config.effort);
+    if (!advice) {
+      if (!this.autoEffortNoted) {
+        this.autoEffortNoted = true;
+        this.line(this.theme.muted(`自动选档暂无依据，本轮按 ${this.config.effort}（/race 会积累依据）。`));
+      }
+      return this.config.effort;
+    }
+    const scope = advice.scope === "all" ? "各类" : QUESTION_KIND_LABELS[shape.kind];
+    const saved = advice.saved === undefined ? "" : ` · 省 ≈${formatCost(advice.saved)}`;
+    this.line(
+      this.theme.muted(
+        `自动选档：${scope}问题你对比过 ${advice.samples} 次，${advice.effort} 赢了 ${advice.wins} 次 → 本轮用 ${advice.effort}${saved}`,
+      ),
+    );
+    return advice.effort;
   }
 
   private lastUserMessage(): string {
@@ -1327,8 +1631,239 @@ export class DeepSeekTui {
       this.line(this.theme.yellow(result.error ?? "无法附加文件。"));
       return;
     }
-    this.line(this.theme.muted(`@${result.path}`));
+    this.line(this.theme.muted(`@${this.shortPath(result.path ?? "")}`));
+    // Remembered so a rewritten version coming back can be shown as a diff
+    // rather than as a wall of mostly-identical code.
+    if (result.path !== undefined && result.content !== undefined) {
+      this.attachments.delete(result.path);
+      this.attachments.set(result.path, result.content);
+      while (this.attachments.size > ATTACHMENT_MEMORY) {
+        const oldest = this.attachments.keys().next();
+        if (oldest.done) break;
+        this.attachments.delete(oldest.value);
+      }
+    }
     await this.sendMessage(attachmentMessage(result.path ?? "", result.content ?? ""));
+  }
+
+  /**
+   * A path short enough to read and still valid as a command argument:
+   * relative to the working directory when it lives there, `~`-prefixed when
+   * it lives under home, absolute otherwise. Printing the absolute path of a
+   * deeply nested file twice in one hint pushes everything else off the line.
+   */
+  private shortPath(path: string): string {
+    const nearby = relativePath(this.cwd, path);
+    if (nearby && !nearby.startsWith("..") && !isAbsolute(nearby)) return nearby;
+    const home = homedir();
+    if (path === home) return "~";
+    if (path.startsWith(`${home}/`)) return `~/${path.slice(home.length + 1)}`;
+    return path;
+  }
+
+  /** Renders a finished answer and files whatever code blocks it framed. */
+  private renderAnswer(text: string): string {
+    const rendered = renderMarkdownWithBlocks(text, this.theme, this.codeBlocks.length + 1);
+    this.fileBlocks(rendered.blocks);
+    return rendered.text;
+  }
+
+  /** Files an answer's blocks under one answer id. */
+  private fileBlocks(blocks: readonly CodeBlock[], answer = (this.answers += 1)): void {
+    this.codeBlocks.push(...blocks.map((block) => ({ ...block, answer })));
+  }
+
+  /**
+   * The block a command means: an explicit number, or the most recent one.
+   * Prints the menu of what is available when the argument makes no sense,
+   * which is also how numbers are discovered after a session is resumed.
+   */
+  private pickCodeBlock(token: string | undefined): SessionBlock | undefined {
+    if (this.codeBlocks.length === 0) {
+      this.line(this.theme.yellow("当前会话还没有出现代码块。"));
+      return undefined;
+    }
+    if (token === undefined) return this.defaultCodeBlock();
+    const index = Number.parseInt(token, 10);
+    const block = this.codeBlocks.find((candidate) => candidate.index === index);
+    if (block) return block;
+    this.line(this.theme.yellow(`没有编号为 ${token} 的代码块。当前可用：`));
+    for (const candidate of this.codeBlocks.slice(-10)) {
+      this.line(
+        this.theme.muted(
+          `  [${candidate.index}] ${candidate.language || "code"} · ${candidate.code.split("\n").length} 行`,
+        ),
+      );
+    }
+    return undefined;
+  }
+
+  private static describeBlock(block: CodeBlock): string {
+    return `[${block.index}] ${block.language || "code"} · ${block.code.split("\n").length} 行`;
+  }
+
+  /**
+   * What `/copy` means with no number.
+   *
+   * Not simply the last block: an answer routinely ends with the output its
+   * code produced, so "the last one" is reliably the one nobody wanted. The
+   * source in the answer you are looking at is what was meant — falling back
+   * to the last source anywhere, and only then to the last block at all.
+   */
+  private defaultCodeBlock(): SessionBlock | undefined {
+    const latest = this.codeBlocks[this.codeBlocks.length - 1]?.answer;
+    const fromLatest = this.codeBlocks.filter((block) => block.answer === latest);
+    return DeepSeekTui.preferSource(fromLatest) ?? DeepSeekTui.preferSource(this.codeBlocks);
+  }
+
+  /** The last source block of a group, or its last block when all are output. */
+  private static preferSource(blocks: readonly SessionBlock[]): SessionBlock | undefined {
+    return [...blocks].reverse().find((block) => !isOutputBlock(block)) ?? blocks[blocks.length - 1];
+  }
+
+  /**
+   * Names the other blocks of the same answer after an implicit pick, so a
+   * guess that went the wrong way is one keystroke from being corrected.
+   */
+  private noteOtherBlocks(block: SessionBlock): void {
+    const siblings = this.codeBlocks.filter(
+      (candidate) => candidate.answer === block.answer && candidate.index !== block.index,
+    );
+    if (siblings.length === 0) return;
+    const listed = siblings.map((sibling) => DeepSeekTui.describeBlock(sibling)).join(" · ");
+    this.line(this.theme.muted(`  同一条回答还有 ${listed}——加编号即可，如 /copy ${String(siblings[0]?.index ?? 1)}`));
+  }
+
+  /**
+   * /copy — put a code block on the clipboard.
+   *
+   * Falls back to OSC 52, which asks the terminal to do it: over SSH the
+   * machine running this client has the wrong clipboard, and that is exactly
+   * when copying by hand is most painful.
+   */
+  private async copyCodeBlock(token: string | undefined): Promise<void> {
+    const block = this.pickCodeBlock(token);
+    if (!block) return;
+    const target = clipboardCommand();
+    if (target) {
+      try {
+        await writeClipboard(block.code, target);
+        this.line(`${this.theme.green("✓")} 已复制 ${DeepSeekTui.describeBlock(block)} ${this.theme.muted(`· ${target.label}`)}`);
+        if (token === undefined) this.noteOtherBlocks(block);
+        return;
+      } catch (error) {
+        this.line(this.theme.yellow(`${target.label} 复制失败：${this.errorMessage(error)}`));
+      }
+    }
+    const bytes = Buffer.byteLength(block.code, "utf8");
+    if (bytes > OSC52_MAX_BYTES) {
+      this.line(this.theme.yellow(`代码块过大（${String(bytes)} 字节），改用 /save ${String(block.index)} <路径> 写入文件。`));
+      return;
+    }
+    this.write(osc52(block.code));
+    this.line(`${this.theme.green("✓")} 已通过 OSC 52 把 ${DeepSeekTui.describeBlock(block)} 交给终端`);
+    this.line(this.theme.muted("（终端未开启剪贴板写入时这一步会被静默忽略，此时请用 /save）"));
+  }
+
+  /** /save — write a code block to a file, on an explicit path only. */
+  private async saveCodeBlock(args: string): Promise<void> {
+    const { index, rest } = splitIndexedArgument(args);
+    if (!rest) {
+      this.line(this.theme.yellow("用法：/save [编号] <路径>。不写编号就用这条回答里的源码块。"));
+      return;
+    }
+    const block = this.pickCodeBlock(index);
+    if (!block) return;
+    const path = expandUserPath(rest, this.cwd);
+    if (await fileExists(path)) {
+      this.line(this.theme.yellow(`${path} 已存在，将被覆盖。`));
+      const answer = await this.input.next(this.theme.brightBlue("继续？[y/N] › "), { history: false });
+      if (answer?.trim().toLocaleLowerCase() !== "y") {
+        this.line(this.theme.muted("已取消。"));
+        return;
+      }
+    }
+    try {
+      // A trailing newline: every other tool in the terminal expects one.
+      await writeFile(path, block.code.endsWith("\n") ? block.code : `${block.code}\n`, "utf8");
+      this.line(`${this.theme.green("✓")} 已写入 ${path} ${this.theme.muted(`· ${DeepSeekTui.describeBlock(block)}`)}`);
+      if (index === undefined) this.noteOtherBlocks(block);
+    } catch (error) {
+      this.line(this.theme.red(`写入失败：${this.errorMessage(error)}`));
+    }
+  }
+
+  /**
+   * /diff — a code block against the file it was derived from.
+   *
+   * The pairing is only ever with a file the user attached in this session:
+   * the client reads nothing on its own, and that boundary does not move for
+   * a convenience.
+   */
+  private showDiff(args: string): void {
+    const { index, rest: requested } = splitIndexedArgument(args);
+    const block = this.pickCodeBlock(index);
+    if (!block) return;
+    if (this.attachments.size === 0) {
+      this.line(this.theme.yellow("还没有用 /attach 附加过文件，没有可比较的原文。"));
+      return;
+    }
+    // The hint prints a short path, so the short path has to resolve back to
+    // the file it named.
+    const path = requested ? expandUserPath(requested, this.cwd) : ([...this.attachments.keys()].pop() ?? "");
+    const original = this.attachments.get(path);
+    if (original === undefined) {
+      this.line(
+        this.theme.yellow(
+          `没有附加过 ${path}。已附加：${[...this.attachments.keys()].map((known) => this.shortPath(known)).join(" · ")}`,
+        ),
+      );
+      return;
+    }
+    const ops = diffLines(original.split("\n"), block.code.split("\n"));
+    if (!ops) {
+      this.line(this.theme.yellow("两者差异过大，diff 已放弃；这更像是一份新文件而不是改动。"));
+      return;
+    }
+    const { added, removed } = summarizeDiff(ops);
+    if (added === 0 && removed === 0) {
+      this.line(this.theme.muted(`代码块 [${String(block.index)}] 与 ${this.shortPath(path)} 完全一致。`));
+      return;
+    }
+    const shown = this.shortPath(path);
+    this.line(
+      `${this.theme.bold(`${shown} → 代码块 [${String(block.index)}]`)} ${this.theme.muted(`+${String(added)} −${String(removed)}`)}`,
+    );
+    for (const line of renderDiff(ops, this.theme)) this.line(clipToWidth(line, this.terminalColumns()));
+    this.line(this.theme.muted(`/save ${String(block.index)} ${shown} 覆盖原文 · /do 让 DSH 按它动手`));
+  }
+
+  /**
+   * After an answer, say so when it looks like a rewrite of an attached file.
+   * Without this the diff is there but nobody knows to ask for it.
+   */
+  private offerAttachmentDiff(answer: number): void {
+    // Only this turn's blocks: judged against the whole session, an answer
+    // that contained no code at all would keep re-offering a diff for the
+    // rewrite two questions ago, as though it had just changed that file.
+    const block = DeepSeekTui.preferSource(this.codeBlocks.filter((candidate) => candidate.answer === answer));
+    if (!block || this.attachments.size === 0) return;
+    const path = [...this.attachments.keys()].pop();
+    const original = path === undefined ? undefined : this.attachments.get(path);
+    if (path === undefined || original === undefined) return;
+    const before = original.split("\n");
+    const after = block.code.split("\n");
+    const ops = diffLines(before, after);
+    if (!ops || !looksLikeEdit(ops, before.length, after.length)) return;
+    const { added, removed } = summarizeDiff(ops);
+    if (added === 0 && removed === 0) return;
+    const shown = this.shortPath(path);
+    this.line(
+      this.theme.muted(
+        `代码块 [${String(block.index)}] 相对 ${shown} 是 +${String(added)} −${String(removed)} · /diff ${String(block.index)} 查看 · /save ${String(block.index)} ${shown} 覆盖`,
+      ),
+    );
+    this.line();
   }
 
   /** /rewind — fork the session at an earlier user message (non-destructive). */
@@ -1573,7 +2108,7 @@ export class DeepSeekTui {
       }
 
       this.write(`${this.theme.blue("◆ DSH")}\n`);
-      this.line(renderMarkdown(result.output, this.theme));
+      this.line(this.renderAnswer(result.output));
       if (result.status !== 0) {
         this.line(this.theme.yellow(`（DSH 退出码 ${String(result.status)}）`));
         if (result.stderr) this.line(this.theme.muted(safeTerminalText(result.stderr).slice(0, 2_000)));
@@ -1685,24 +2220,28 @@ export class DeepSeekTui {
     return parts.join(" · ");
   }
 
-  private async sendMessage(text: string): Promise<void> {
-    if (!this.session) return;
+  /** Credentials for a request, or a warning when no API Key is configured. */
+  private requireCredentials(): Credentials | undefined {
     const runtime = this.configStore.runtime(this.config);
-    if (!runtime.apiKey) {
-      this.line(this.theme.yellow("缺少 API Key。请先输入 /login，或设置 DEEPSEEK_API_KEY。"));
-      return;
-    }
-    const userMessage: ChatMessage = {
-      role: "user",
-      content: text,
-      createdAt: new Date().toISOString(),
-    };
-    const titleBefore = this.session.title;
-    this.session.messages.push(userMessage);
-    if (this.session.title === "New conversation") this.session.title = deriveTitle(text);
-    await this.saveSession();
+    if (runtime.apiKey) return { apiKey: runtime.apiKey, baseUrl: runtime.baseUrl };
+    this.line(this.theme.yellow("缺少 API Key。请先输入 /login，或设置 DEEPSEEK_API_KEY。"));
+    return undefined;
+  }
 
-    const messages = this.requestMessages(this.session.messages);
+  /**
+   * Streams one assistant reply onto the terminal: spinner, optional thinking
+   * block, Markdown and timing. Every answer goes through here, so a new turn,
+   * a prefilled one and the second half of an interrupted one all look alike.
+   *
+   * Never throws. An interrupted or failed stream comes back as `error` with
+   * whatever text had already arrived, and the caller decides what to keep.
+   */
+  private async streamAssistant(options: AssistantTurnOptions): Promise<AssistantTurn> {
+    if (options.prefixContinuation && !isOfficialEndpoint(options.credentials.baseUrl)) {
+      this.line(
+        this.theme.muted(`前缀续写走官方 Beta 接口；当前 Endpoint ${options.credentials.baseUrl} 未必支持。`),
+      );
+    }
     this.controller = new AbortController();
     const generationGuard = this.beginGenerationGuard();
     const startedAt = Date.now();
@@ -1710,20 +2249,32 @@ export class DeepSeekTui {
     let reasoning = "";
     let reasoningShown = false;
     let contentShown = false;
-    const markdown = new MarkdownStream({ theme: this.theme });
+    const markdown = new MarkdownStream({ theme: this.theme, numberFrom: options.numberFrom });
     const spinner = new Spinner(this.output, (frame, elapsedMs) =>
-      this.generationStatus(frame, elapsedMs, reasoning, "正在思考"),
+      this.generationStatus(frame, elapsedMs, reasoning, options.label ?? "正在思考"),
     );
+    /** Opens the answer block, replaying text the answer is known to start with. */
+    const openAnswer = (): void => {
+      spinner.stop();
+      if (reasoningShown) this.write(`\n${this.theme.muted("╰─")}\n\n`);
+      this.write(`${this.theme.blue("◆ DeepSeek")}\n`);
+      contentShown = true;
+      if (options.echo) this.write(markdown.write(options.echo));
+    };
     this.write("\n");
     spinner.start();
     try {
       const result = await streamChat({
-        apiKey: runtime.apiKey,
-        baseUrl: runtime.baseUrl,
-        model: this.session.model,
-        messages,
-        effort: this.config.effort,
+        apiKey: options.credentials.apiKey,
+        baseUrl: options.prefixContinuation
+          ? prefixBaseUrl(options.credentials.baseUrl)
+          : options.credentials.baseUrl,
+        model: options.model,
+        messages: options.messages,
+        effort: options.effort,
         signal: this.controller.signal,
+        ...(options.prefixContinuation ? { prefixContinuation: true } : {}),
+        ...(options.stop ? { stop: options.stop } : {}),
         onReasoning: (delta) => {
           reasoning += delta;
           if (!this.config.showReasoning) {
@@ -1739,66 +2290,231 @@ export class DeepSeekTui {
         },
         onContent: (delta) => {
           content += delta;
-          if (!contentShown) {
-            spinner.stop();
-            if (reasoningShown) this.write(`\n${this.theme.muted("╰─")}\n\n`);
-            this.write(`${this.theme.blue("◆ DeepSeek")}\n`);
-            contentShown = true;
-          }
+          if (!contentShown) openAnswer();
           this.write(markdown.write(delta));
         },
       });
       spinner.stop();
       this.write(markdown.end());
       if (!contentShown) {
-        this.write(`${this.theme.blue("◆ DeepSeek")}\n${this.theme.muted("(没有文本响应)")}`);
+        // An echo is text the answer already has, so it is still worth drawing
+        // even when the model added nothing to it.
+        if (options.echo) {
+          openAnswer();
+          this.write(markdown.end());
+          this.write(this.theme.muted("\n(没有新增内容)"));
+        } else this.write(`${this.theme.blue("◆ DeepSeek")}\n${this.theme.muted("(没有文本响应)")}`);
       }
-      const assistant: ChatMessage = {
-        role: "assistant",
+      return {
         content: result.content,
-        createdAt: new Date().toISOString(),
+        reasoning: result.reasoningContent,
+        usage: result.usage,
+        // One measurement for every readout: taking it twice made the turn
+        // footer and /status disagree by however long the session save took.
+        elapsedMs: Math.max(1, Date.now() - startedAt),
+        blocks: markdown.blocks,
+        echoed: contentShown,
       };
-      if (result.reasoningContent) assistant.reasoningContent = result.reasoningContent;
-      this.session.messages.push(assistant);
-      this.session.usage = addUsage(this.session.usage, result.usage);
-      // One measurement for both readouts: taking it twice made the turn
-      // footer and /status disagree by however long the session save took.
-      const elapsedMs = Math.max(1, Date.now() - startedAt);
-      this.session.lastTurnMs = elapsedMs;
-      this.session.lastCompletionTokens = result.usage.completionTokens;
-      this.chargeBalance(result.usage);
-      await this.saveSession();
-      this.write(`\n\n${this.theme.muted(this.turnFooter(result.usage, elapsedMs))}\n\n`);
-      // Reconcile with the real figure for the next turn's footer.
-      this.refreshBalance();
     } catch (error) {
       spinner.stop();
       // Close a code fence the interrupted reply left open, or the frame
       // would swallow every line printed after it.
       this.write(markdown.end());
-      // Keep a partial answer, but never store an assistant turn with empty
-      // content: the API rejects it on the next request.
-      if (content.trim()) {
-        const partial: ChatMessage = { role: "assistant", content, createdAt: new Date().toISOString() };
-        if (reasoning) partial.reasoningContent = reasoning;
-        this.session.messages.push(partial);
-        await this.saveSession();
-      } else if (this.session.messages[this.session.messages.length - 1] === userMessage) {
-        // Nothing came back, so the prompt would otherwise be stranded as a
-        // trailing user turn — which both pollutes the transcript and leaves
-        // two user messages in a row on the next request. Drop it; the line
-        // is still in the input history, so ↑ brings it straight back.
-        this.session.messages.pop();
-        if (this.session.messages.length === 0) this.session.title = titleBefore;
-        await this.saveSession();
-        this.line(`\n${this.theme.muted("本轮未记录到会话（按 ↑ 可召回刚才的输入）。")}`);
-      }
-      if ((error as Error).name === "AbortError") this.line(`\n${this.theme.yellow("已中断本次生成。")}\n`);
-      else this.line(`\n${this.theme.red(`请求失败：${this.errorMessage(error)}`)}\n`);
+      return {
+        content,
+        reasoning,
+        usage: { ...EMPTY_USAGE },
+        elapsedMs: Math.max(1, Date.now() - startedAt),
+        blocks: markdown.blocks,
+        echoed: contentShown,
+        error,
+      };
     } finally {
       spinner.stop();
       generationGuard.detach();
       this.controller = undefined;
+    }
+  }
+
+  /** Books a finished turn: usage, timing, balance and the footer line. */
+  private async recordTurn(usage: TokenUsage, elapsedMs: number): Promise<void> {
+    if (!this.session) return;
+    this.session.usage = addUsage(this.session.usage, usage);
+    this.session.lastTurnMs = elapsedMs;
+    this.session.lastCompletionTokens = usage.completionTokens;
+    this.chargeBalance(usage);
+    await this.saveSession();
+    this.write(`\n\n${this.theme.muted(this.turnFooter(usage, elapsedMs))}\n\n`);
+    // Reconcile with the real figure for the next turn's footer.
+    this.refreshBalance();
+  }
+
+  private reportTurnError(error: unknown): void {
+    if ((error as Error).name === "AbortError") this.line(`\n${this.theme.yellow("已中断本次生成。")}\n`);
+    else this.line(`\n${this.theme.red(`请求失败：${this.errorMessage(error)}`)}\n`);
+  }
+
+  private async sendMessage(text: string): Promise<void> {
+    if (!this.session) return;
+    const credentials = this.requireCredentials();
+    if (!credentials) return;
+    const userMessage: ChatMessage = {
+      role: "user",
+      content: text,
+      createdAt: new Date().toISOString(),
+    };
+    const titleBefore = this.session.title;
+    this.session.messages.push(userMessage);
+    if (this.session.title === "New conversation") this.session.title = deriveTitle(text);
+    await this.saveSession();
+
+    // One-shot: a prefill that silently shaped every later answer would be a
+    // hidden mode. Taken up front so a failed turn does not leave it armed.
+    const prefill = this.prefill;
+    this.prefill = undefined;
+    const planned = this.requestMessages(this.session.messages);
+    const messages = prefill
+      ? [...planned, { role: "assistant" as const, content: prefill.text, createdAt: new Date().toISOString() }]
+      : planned;
+
+    const turn = await this.streamAssistant({
+      credentials,
+      model: this.session.model,
+      messages,
+      numberFrom: this.codeBlocks.length + 1,
+      effort: await this.effortFor(text),
+      ...(prefill
+        ? { prefixContinuation: true, echo: prefill.text, ...(prefill.stop ? { stop: prefill.stop } : {}) }
+        : {}),
+    });
+    const answer = prefill ? applyPrefill(prefill, turn.content) : turn.content;
+    this.fileBlocks(turn.blocks);
+
+    if (!turn.error) {
+      const assistant: ChatMessage = {
+        role: "assistant",
+        content: answer,
+        createdAt: new Date().toISOString(),
+      };
+      if (turn.reasoning) assistant.reasoningContent = turn.reasoning;
+      this.session.messages.push(assistant);
+      await this.recordTurn(turn.usage, turn.elapsedMs);
+      this.offerAttachmentDiff(this.answers);
+      return;
+    }
+
+    // Keep a partial answer, but never store an assistant turn with empty
+    // content: the API rejects it on the next request. The test is on what the
+    // model returned, not on `answer` — with a prefill armed, `answer` is
+    // non-empty even when nothing whatsoever was generated, and storing that
+    // would put words in the model's mouth and strand the user's message.
+    if (turn.content.trim()) {
+      const partial: ChatMessage = { role: "assistant", content: answer, createdAt: new Date().toISOString() };
+      if (turn.reasoning) partial.reasoningContent = turn.reasoning;
+      this.session.messages.push(partial);
+      await this.saveSession();
+    } else if (this.session.messages[this.session.messages.length - 1] === userMessage) {
+      // Nothing came back, so the prompt would otherwise be stranded as a
+      // trailing user turn — which both pollutes the transcript and leaves
+      // two user messages in a row on the next request. Drop it; the line
+      // is still in the input history, so ↑ brings it straight back.
+      this.session.messages.pop();
+      if (this.session.messages.length === 0) this.session.title = titleBefore;
+      await this.saveSession();
+      this.line(`\n${this.theme.muted("本轮未记录到会话（按 ↑ 可召回刚才的输入）。")}`);
+    }
+    this.reportTurnError(turn.error);
+  }
+
+  /**
+   * /continue — finish the answer that was cut off.
+   *
+   * An interrupted reply is already kept in the session; until now the only
+   * way to get the rest was to ask again, which pays for the whole thinking
+   * pass a second time. DeepSeek's beta prefix completion finishes the message
+   * instead, so the second half costs what a second half should.
+   */
+  private async continueAnswer(): Promise<void> {
+    if (!this.session) return;
+    const last = this.session.messages[this.session.messages.length - 1];
+    if (!last || last.role !== "assistant" || !last.content.trim()) {
+      this.line(this.theme.yellow("没有可以续写的内容：/continue 接在助手回复之后使用（例如被 Esc 中断的那条）。"));
+      return;
+    }
+    const credentials = this.requireCredentials();
+    if (!credentials) return;
+
+    const before = last.content;
+    // The echo re-draws the blocks the interrupted half already had, so those
+    // numbers are re-issued rather than duplicated.
+    const reissued = extractCodeBlocks(before).length;
+    const turn = await this.streamAssistant({
+      credentials,
+      model: this.session.model,
+      messages: this.requestMessages(this.session.messages),
+      effort: this.config.effort,
+      numberFrom: Math.max(1, this.codeBlocks.length - reissued + 1),
+      prefixContinuation: true,
+      echo: before,
+      label: "正在续写",
+    });
+    // Only re-file when the echo was actually redrawn. A request that failed
+    // before its first token drew nothing, and swapping its empty block list
+    // in would delete the interrupted half's numbering — and, on a retry,
+    // start eating an earlier answer's blocks instead.
+    if (turn.echoed) {
+      // The continuation belongs to the answer it is finishing, not a new one.
+      const resumed = this.codeBlocks[this.codeBlocks.length - reissued]?.answer;
+      this.codeBlocks.splice(Math.max(0, this.codeBlocks.length - reissued));
+      this.fileBlocks(turn.blocks, resumed ?? (this.answers += 1));
+    }
+
+    if (turn.content) {
+      last.content = `${before}${turn.content}`;
+      if (turn.reasoning) {
+        last.reasoningContent = last.reasoningContent ? `${last.reasoningContent}\n${turn.reasoning}` : turn.reasoning;
+      }
+    }
+    if (turn.error) {
+      if (turn.content) await this.saveSession();
+      this.reportTurnError(turn.error);
+      return;
+    }
+    if (!turn.content.trim()) {
+      this.line(`\n${this.theme.muted("模型没有再补充内容，这条回答保持原样。")}\n`);
+      return;
+    }
+    await this.recordTurn(turn.usage, turn.elapsedMs);
+  }
+
+  /** /prefill — force the next answer to start with something (one-shot). */
+  private prefillNext(raw: string): void {
+    const input = raw.trim();
+    if (!input) {
+      if (this.prefill) {
+        this.line(`下一条回答将以 ${this.theme.bold(oneLine(this.prefill.label, 60))} 开头（仅一次）。`);
+        this.line(this.theme.muted("/prefill off 取消。"));
+        return;
+      }
+      this.line(this.theme.muted("用法：/prefill <文本>——下一条回答会以这段文本开头。"));
+      this.line(this.theme.muted("例：/prefill ```python 只要代码；/prefill 结论： 直接给结论。支持 \\n 换行，/prefill off 取消。"));
+      return;
+    }
+    if (/^(?:off|none|clear|-)$/iu.test(input)) {
+      if (!this.prefill) {
+        this.line(this.theme.muted("当前没有待用的前缀。"));
+        return;
+      }
+      this.prefill = undefined;
+      this.line(this.theme.muted("已取消前缀。"));
+      return;
+    }
+    const plan = planPrefill(input);
+    if (!plan) return;
+    this.prefill = plan;
+    this.line(`${this.theme.green("✓")} 下一条回答将以 ${this.theme.bold(oneLine(plan.label, 60))} 开头（仅一次）`);
+    if (plan.stop) {
+      this.line(this.theme.muted(`遇到 ${plan.stop.join(" / ")} 即停止，因此回答里只会有这一个代码块。`));
     }
   }
 

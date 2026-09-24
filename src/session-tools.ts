@@ -183,18 +183,23 @@ export interface AttachmentResult {
 }
 
 /** Reads a text file for /attach: size-capped, binary-rejected, ~ expanded. */
+/** `~`, `~/x` and relative paths, resolved the way a shell would. */
+export function expandUserPath(input: string, cwd: string): string {
+  let expanded = input.trim();
+  if (expanded === "~") expanded = homedir();
+  else if (expanded.startsWith("~/") || expanded.startsWith("~\\")) {
+    expanded = join(homedir(), expanded.slice(2));
+  }
+  return isAbsolute(expanded) ? resolve(expanded) : resolve(cwd, expanded);
+}
+
 export async function readAttachmentFile(
   input: string,
   cwd: string,
   maxBytes = ATTACH_MAX_BYTES,
 ): Promise<AttachmentResult> {
-  let expanded = input.trim();
-  if (!expanded) return { ok: false, error: "用法：/attach <文件路径>" };
-  if (expanded === "~") expanded = homedir();
-  else if (expanded.startsWith("~/") || expanded.startsWith("~\\")) {
-    expanded = join(homedir(), expanded.slice(2));
-  }
-  const path = isAbsolute(expanded) ? resolve(expanded) : resolve(cwd, expanded);
+  if (!input.trim()) return { ok: false, error: "用法：/attach <文件路径>" };
+  const path = expandUserPath(input, cwd);
   let info;
   try {
     info = await stat(path);

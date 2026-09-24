@@ -50,6 +50,7 @@ export function normalizeConfig(value: unknown): AppConfig {
       ? value.contextLimitTokens
       : DEFAULT_CONFIG.contextLimitTokens,
     effort: isValidEffort(value.effort) ? value.effort : DEFAULT_CONFIG.effort,
+    effortAuto: typeof value.effortAuto === "boolean" ? value.effortAuto : DEFAULT_CONFIG.effortAuto,
   };
   if (typeof value.apiKey === "string" && value.apiKey.trim()) config.apiKey = value.apiKey.trim();
   const pricing = normalizePricing(value.pricing);

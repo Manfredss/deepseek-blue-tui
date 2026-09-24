@@ -29,7 +29,7 @@ An unofficial, community-built terminal client for DeepSeek. Streaming chat with
 
 ## Contents
 
-[Features](#features) · [Install](#install) · [Quick start](#quick-start) · [Slash commands](#slash-commands) · [Delegating to DSH](#delegating-to-dsh) · [Comparing thinking effort](#comparing-thinking-effort) · [Context cache and cost](#context-cache-and-cost) · [CLI usage](#cli-usage) · [Configuration](#configuration) · [Security](#security) · [Limitations](#limitations) · [Development](#development)
+[Features](#features) · [Install](#install) · [Quick start](#quick-start) · [Slash commands](#slash-commands) · [Delegating to DSH](#delegating-to-dsh) · [Comparing thinking effort](#comparing-thinking-effort) · [Finishing and steering an answer](#finishing-and-steering-an-answer) · [Code blocks as artifacts](#code-blocks-as-artifacts) · [Context cache and cost](#context-cache-and-cost) · [CLI usage](#cli-usage) · [Configuration](#configuration) · [Security](#security) · [Limitations](#limitations) · [Development](#development)
 
 ---
 
@@ -40,7 +40,9 @@ An unofficial, community-built terminal client for DeepSeek. Streaming chat with
 | ⚡ **Streaming chat** | Direct to DeepSeek's OpenAI-compatible API. Defaults to `deepseek-v4-flash`; switch to `deepseek-v4-pro` or any custom model ID. |
 | 📝 **Markdown as it streams** | Fenced code gets a language label, a gutter and light tinting. Text appears **as it is generated**, not after each line completes. Code is never truncated or reflowed. |
 | 🧠 **Thinking effort** | `/effort [low\|high\|max]` maps to the official `reasoning_effort`; `/thinking` shows or hides the reasoning stream. |
-| 🏁 **Effort measured, not guessed** | `/race low max <question>` asks the same question at several efforts in parallel and compares latency, tokens and cost before you keep one. |
+| 🏁 **Effort measured, then learned** | `/race low max <question>` compares latency, tokens and cost across efforts (or models) before you keep one — and every verdict is filed, so `/effort auto` can pick the level for each question and show its evidence. |
+| ⏭️ **Finish and steer answers** | `/continue` completes an interrupted reply through the official beta prefix completion instead of paying for the whole thinking pass again; `/prefill ```python` makes the answer open with code and nothing else. |
+| 📦 **Code blocks as artifacts** | Blocks in a reply are numbered: `/copy` to the clipboard (OSC 52 when there is no local tool), `/save` to a file, `/diff` against the file you attached. |
 | 🤖 **Hand work to an agent** | `/do <task>` passes a distilled version of the conversation to `dsh --profile headless`, which actually edits files and runs commands, then folds the result back into the session. |
 | 💰 **Cache-aware cost** | `/cache` shows hit rate and estimated spend. `/compact` and switching model invalidate the whole cached prefix — both say what that will cost **before** asking to continue. |
 | 🗂️ **Session workflow** | `/btw` side questions, `/compact` with automatic backup, `/export` to Markdown, `/rewind` to branch, `/search` full-text within a session. |
@@ -121,16 +123,21 @@ There is a neutral alias, **`dstui`**, identical to `deepseek`, for when the nam
 | `/resume [id/title]` | Browse or match sessions for this directory (alias `/sessions`) |
 | `/rename <title>` | Rename the current session |
 | `/thinking [on\|off]` | Show or hide the reasoning stream |
-| `/effort [low\|high\|max]` | Set thinking effort |
+| `/effort [low\|high\|max\|auto]` | Set thinking effort; `auto` picks it per question from the `/race` ledger |
 | `/status` | Model, endpoint, context pressure, tokens, cache, speed, credentials, DSH |
 | `/context` | Per-message token audit and a breakdown by role |
 | `/cache` | Cache hit rate, reusable prefix, estimated spend |
 | `/btw <question>` | Ask once against the current context without recording it |
-| `/race [efforts…] <question>` | Run several efforts in parallel and keep one |
+| `/race [branches…] <question>` | Run several efforts or models in parallel and keep one (`--blind`, `stats`) |
+| `/continue` | Finish the reply that was interrupted, without re-thinking it |
+| `/prefill <text>` | Make the next answer start with this text (one turn only) |
 | `/compact` | Compress history into one summary (backs up first) |
 | `/export` | Write the session out as Markdown |
 | `/edit [draft]` | Compose the next message in `$VISUAL`/`$EDITOR` |
 | `/attach <path>` | Attach a text file (≤256 KiB, binaries refused) |
+| `/copy [n]` | Copy a code block from the reply to the clipboard |
+| `/save [n] <path>` | Write a code block to a file (confirms before overwriting) |
+| `/diff [n] [path]` | Compare a code block against the file you attached |
 | `/rewind [n]` | Branch a new session from an earlier message |
 | `/search <text>` | Line-grained full-text search within the session |
 | `/do <task>` | Hand a task to the DSH agent (alias `/agent`) |
@@ -187,6 +194,71 @@ Keep which one? (the rest are discarded)
 ```
 
 Discarded branches are **still billed**, so all of them count toward session usage — and the UI says so.
+
+Models can race too: `/race flash pro <question>`, or `/race pro@max low <question>`. Only effort names, known model aliases and `deepseek-*` ids count as branches — anything else is the question itself. `/race --blind` hides which branch is which (and shuffles the rows) until after you pick, so "the slow expensive one" cannot give itself away.
+
+**Every verdict is filed.** The branch you keep is a labelled sample of "for this kind of question, that effort was worth its price", so it goes into `races.jsonl` with the question's kind and size and each branch's time, tokens and cost. `/race stats` shows the tally, and `/effort auto` uses it:
+
+```
+❯ write a function that flattens this config
+auto effort: 写代码 · 5 races, low won 4 → low this turn · saves ≈$0.0038
+```
+
+The rules stay conservative: with fewer than three comparable races, or a level raced only once, it says it has no basis and keeps your configured level; equal win rates go to the cheaper level; a level never raced is never recommended, and no saving is quoted unless both sides were priced.
+
+---
+
+## Finishing and steering an answer
+
+Both use the official beta [prefix completion](https://api-docs.deepseek.com/guides/chat_prefix_completion): a trailing assistant message is treated as the *start* of the answer rather than a finished turn.
+
+`/continue` finishes a reply that <kbd>Esc</kbd> cut off. The half already generated was always kept; until now the only way to get the rest was to ask again and pay for the entire thinking pass a second time. The screen redraws the answer as one piece, and the session still holds one message, not two.
+
+`/prefill <text>` decides how the next answer opens:
+
+```bash
+/prefill ```python     # start inside a code fence, stop at its close — code only
+/prefill 结论：         # skip the preamble, answer with the conclusion
+/prefill off           # cancel
+```
+
+It applies to **one** turn. A prefill that quietly shaped every later answer would be a hidden mode; the pending one is shown in `/status`. The closing fence the stop sequence removes is restored, so exported Markdown is never left half-open.
+
+> [!NOTE]
+> Prefix completion is a beta feature served only from the official `/beta` path. A custom OpenAI-compatible gateway is called exactly as configured — inventing a `/beta` route would turn a working endpoint into a 404 — with a note that it may not support the feature. Failures are reported, never silently downgraded.
+
+---
+
+## Code blocks as artifacts
+
+For a client whose main use is programming questions, the sharpest edge was that code arrived and then had to be selected with a mouse. Fenced blocks now carry a number (`┌─ [1] python`):
+
+```bash
+/copy            # the source block of this answer
+/copy 1          # by number
+/save 1 out.py   # write it out (confirms before overwriting)
+/diff 1          # against the file you attached
+```
+
+With no number it is **not** the last block: an answer usually ends with the output its code produced, which is never the one you meant. The rule is "the last *source* block of this answer", decided in three steps: the language tag when there is one (`text`, `output`, `console`, `log`, `stdout` are output); otherwise the line of prose above the fence ("运行示例输出：", "Output:"), because a model that tagged the first output block routinely leaves the second bare; otherwise the content itself, so a bare `npm install -g .` stays copyable while `原始数组: 29 25 3` does not. An answer made only of output falls back to it. Any other block of the same answer is named alongside, so a wrong guess costs one number:
+
+```
+❯ /copy
+✓ copied [1] python · 52 lines · pbcopy
+  this answer also has [2] text · 2 lines — /copy 2
+```
+
+`/copy` uses the platform's own command (`pbcopy`, `clip`, `wl-copy`/`xclip`/`xsel`), and falls back to **OSC 52** so the terminal itself does the copying — over SSH the local clipboard is the wrong machine's. `DEEPSEEK_TUI_CLIPBOARD` overrides the lookup.
+
+`/save` is the only place this client writes to the workspace, always at a path you gave it.
+
+When a file you attached comes back rewritten, the turn ends by saying what changed rather than leaving you to spot it in a screen of near-identical code:
+
+```
+code block [1] vs src/config.py: +12 −3 · /diff 1 · /save 1 src/config.py
+```
+
+Applying it for real is still `/do`, which hands the job to DSH.
 
 ---
 
@@ -259,9 +331,10 @@ Data lives under `$XDG_CONFIG_HOME/deepseek-tui` (or `~/.config/deepseek-tui`; `
 | `sessions/` | One JSON file per session, isolated by working directory |
 | `exports/` | `/export` and `/compact` backups |
 | `history` | Cross-session input history (`0600`, 500 entries) |
+| `races.jsonl` | Verdicts from `/race` (`0600`); the evidence behind `/effort auto` |
 | `dsh/` | DSH state and rotated logs |
 
-Environment: `DEEPSEEK_API_KEY`, `DEEPSEEK_BASE_URL`, `DEEPSEEK_DSH_COMMAND`, `DEEPSEEK_TUI_HOME`, `NO_COLOR`.
+Environment: `DEEPSEEK_API_KEY`, `DEEPSEEK_BASE_URL`, `DEEPSEEK_DSH_COMMAND`, `DEEPSEEK_TUI_CLIPBOARD`, `DEEPSEEK_TUI_HOME`, `NO_COLOR`.
 
 ---
 
@@ -283,6 +356,9 @@ Environment: `DEEPSEEK_API_KEY`, `DEEPSEEK_BASE_URL`, `DEEPSEEK_DSH_COMMAND`, `D
 - Costs are estimates at peak rates and may drift from published pricing; override them in config.
 - DSH is a developer preview upstream and may change without notice.
 - The DSH background process is not a service; it does not survive a reboot.
+- `/effort auto` reasons only from your own races, so its samples are few; it says when it has no basis, and the question classifier is local keyword matching, not comprehension.
+- `/continue` and `/prefill` need the official beta prefix completion; a custom endpoint may not serve it.
+- Reading a file is `/attach` only, writing one is `/save` only — both at a path you type, neither initiated by the model.
 
 ---
 

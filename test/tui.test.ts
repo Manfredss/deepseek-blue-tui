@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createServer, type Server } from "node:http";
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
@@ -60,13 +60,22 @@ async function until(check: () => boolean, message: string, timeoutMs = 5_000): 
   }
 }
 
+interface MockBody {
+  reasoning_effort?: string;
+  model?: string;
+  stop?: string[];
+  messages?: { role: string; content: string; prefix?: boolean }[];
+}
+
 interface MockOptions {
   content?: string[];
   status?: number;
   errorBody?: string;
   delayMs?: number;
   /** Reply text chosen from the request body (used to tell /race branches apart). */
-  replyFor?: (body: { reasoning_effort?: string }) => string;
+  replyFor?: (body: MockBody) => string;
+  /** Every request body the client sent, in order. */
+  capture?: MockBody[];
 }
 
 async function startMockApi(t: TestContext, options: MockOptions = {}): Promise<string> {
@@ -81,12 +90,14 @@ async function startMockApi(t: TestContext, options: MockOptions = {}): Promise<
         return;
       }
       response.writeHead(200, { "Content-Type": "text/event-stream" });
-      let body: { reasoning_effort?: string } = {};
+      let body: MockBody = {};
       try {
-        body = JSON.parse(raw || "{}") as { reasoning_effort?: string };
+        body = JSON.parse(raw || "{}") as MockBody;
       } catch {
         body = {};
       }
+      // Balance polls hit the same server; only chat requests are interesting.
+      if (request.url?.includes("/chat/completions")) options.capture?.push(body);
       const chosen = options.replyFor ? [options.replyFor(body)] : (options.content ?? ["ok"]);
       const events = chosen.map(
         (delta) => `data: ${JSON.stringify({ choices: [{ delta: { content: delta } }] })}\n\n`,
@@ -350,6 +361,115 @@ test("a partial answer is kept when the generation is interrupted", async (t: Te
   assert.ok((saved?.messages[1]?.content.length ?? 0) > 0, "the partial answer is not thrown away");
 });
 
+test("/continue finishes the interrupted answer instead of asking again", async (t: TestContext) => {
+  const capture: MockBody[] = [];
+  const baseUrl = await startMockApi(t, {
+    content: ["一\n", "二\n", "三\n", "四\n", "五\n"],
+    delayMs: 120,
+    capture,
+  });
+  const app = await harness(t, { config: { baseUrl } });
+  await app.start();
+
+  app.input.write("慢慢来\n");
+  await until(() => app.plain().includes("一"), "the first chunk should have streamed");
+  app.input.write(ESC);
+  await until(() => app.plain().includes("已中断本次生成"), "Esc should abort the generation");
+  const [interrupted] = await app.sessionStore.list({});
+  const half = interrupted?.messages[1]?.content ?? "";
+  assert.ok(half.length > 0, "there is a partial answer to finish");
+
+  await app.send("/continue", 50);
+  await until(() => app.plain().includes("tok/s"), "the continuation should finish");
+  await app.finish();
+
+  const [saved] = await app.sessionStore.list({});
+  assert.equal(saved?.messages.length, 2, "the continuation merges into the same reply");
+  assert.ok(saved?.messages[1]?.content.startsWith(half), "the half already generated is kept");
+  assert.ok((saved?.messages[1]?.content.length ?? 0) > half.length, "and the rest is appended");
+
+  const last = capture[capture.length - 1];
+  const trailing = last?.messages?.[(last.messages?.length ?? 0) - 1];
+  assert.equal(trailing?.role, "assistant");
+  assert.equal(trailing?.prefix, true, "the partial answer is sent as a prefix to finish");
+});
+
+test("a failed /continue leaves the interrupted answer's blocks addressable", async (t: TestContext) => {
+  const baseUrl = await startMockApi(t, { status: 500 });
+  const session = createSession(process.cwd(), DEFAULT_CONFIG.model);
+  session.messages = [
+    { role: "user", content: "写个函数", createdAt: new Date().toISOString() },
+    { role: "assistant", content: "```python\ndef f():\n    return 1\n```\n接着", createdAt: new Date().toISOString() },
+  ];
+  const app = await harness(t, { config: { baseUrl }, session });
+  await app.start();
+
+  const failed = await app.send("/continue", 400);
+  assert.match(failed, /请求失败/u);
+
+  // The half that was already generated is still on screen and in the session,
+  // so its block must still answer to its number.
+  const saved = await app.send("/save 1 out.py", 300);
+  assert.match(saved, /已写入/u);
+  assert.equal(await readFile(join(app.home, "out.py"), "utf8"), "def f():\n    return 1\n");
+  await app.finish();
+});
+
+test("a prefill that never generated anything is not written into the session", async (t: TestContext) => {
+  const baseUrl = await startMockApi(t, { status: 500 });
+  const app = await harness(t, { config: { baseUrl } });
+  await app.start();
+
+  await app.send("/prefill 结论：", 150);
+  const failed = await app.send("问题", 400);
+  assert.match(failed, /请求失败/u);
+  assert.match(failed, /本轮未记录到会话/u, "the prompt is handed back rather than stranded");
+  await app.finish();
+
+  // `list` hides empty conversations, so this is the strongest form of
+  // "nothing was recorded" — with the prefill counted as content, the
+  // transcript would hold a user turn and an answer nobody ever saw.
+  const recorded = (await app.sessionStore.list({})).flatMap((item) => item.messages);
+  assert.deepEqual(recorded, [], "a prefill is not an answer the model gave");
+});
+
+test("/continue explains itself when there is nothing to finish", async (t: TestContext) => {
+  const baseUrl = await startMockApi(t);
+  const app = await harness(t, { config: { baseUrl } });
+  await app.start();
+
+  const out = await app.send("/continue", 200);
+  assert.match(out, /没有可以续写的内容/u);
+  await app.finish();
+});
+
+test("/prefill opens the answer with a code fence, for one turn only", async (t: TestContext) => {
+  const capture: MockBody[] = [];
+  const baseUrl = await startMockApi(t, { content: ["print(1)\n"], capture });
+  const app = await harness(t, { config: { baseUrl } });
+  await app.start();
+
+  const armed = await app.send("/prefill ```python", 150);
+  assert.match(armed, /下一条回答将以/u);
+  assert.match(await app.send("/status", 250), /前缀/u);
+
+  await app.send("写个 hello", 500);
+  const [saved] = await app.sessionStore.list({});
+  const answer = saved?.messages[1]?.content ?? "";
+  assert.ok(answer.startsWith("```python\n"), `the answer keeps the prefill: ${answer}`);
+  assert.ok(answer.trimEnd().endsWith("```"), "the fence the stop sequence ate is restored");
+  const first = capture[0];
+  assert.deepEqual(first?.stop, ["```"]);
+  assert.equal(first?.messages?.[(first.messages?.length ?? 0) - 1]?.prefix, true);
+
+  // One-shot: the next turn is an ordinary reply again.
+  await app.send("再写一个", 500);
+  const later = capture[capture.length - 1];
+  assert.equal(later?.messages?.[(later.messages?.length ?? 0) - 1]?.role, "user");
+  assert.equal("stop" in (later ?? {}), false);
+  await app.finish();
+});
+
 test("the turn footer and /status report the same generation speed", async (t: TestContext) => {
   const baseUrl = await startMockApi(t, { content: ["答案"] });
   const app = await harness(t, { config: { baseUrl } });
@@ -475,10 +595,129 @@ test("a fenced code block in a reply is framed rather than dumped as raw text", 
   await app.start();
   const out = await app.send("给我代码", 500);
 
-  assert.match(out, /┌─ ts/, "the code block is labelled");
+  assert.match(out, /┌─ \[1\] ts/, "the code block is framed, numbered and labelled");
   assert.match(out, /│ const x = 1;/, "code carries the gutter even when deltas split the fence");
   assert.match(out, /└─/, "and the block is closed");
   assert.doesNotMatch(out, /```/, "raw fences are consumed, not printed");
+  await app.finish();
+});
+
+test("/copy explains itself before there is anything to copy", async (t: TestContext) => {
+  const app = await harness(t);
+  await app.start();
+  assert.match(await app.send("/copy"), /还没有出现代码块/u);
+  await app.finish();
+});
+
+test(
+  "/copy hands the code block to the clipboard command",
+  // The stand-in clipboard is a POSIX script; the command lookup itself is
+  // covered per-platform in artifacts.test.ts.
+  { skip: process.platform === "win32" ? "needs a POSIX shell" : false },
+  async (t: TestContext) => {
+    const baseUrl = await startMockApi(t, { content: ["给你：\n\n```ts\nconst x = 1;\n```\n"] });
+    const app = await harness(t, { config: { baseUrl } });
+    const sink = join(app.home, "clipboard.txt");
+    const script = join(app.home, "fake-copy");
+    await writeFile(script, `#!/bin/sh\ncat > ${JSON.stringify(sink)}\n`, { mode: 0o755 });
+    process.env.DEEPSEEK_TUI_CLIPBOARD = script;
+    t.after(() => {
+      delete process.env.DEEPSEEK_TUI_CLIPBOARD;
+    });
+
+    await app.start();
+    const turn = await app.send("给我代码", 500);
+    assert.match(turn, /┌─ \[1\] ts/u, "the block is numbered so it can be named");
+    const copied = await app.send("/copy", 400);
+    assert.match(copied, /已复制 \[1\] ts/u);
+    assert.equal(await readFile(sink, "utf8"), "const x = 1;", "the code is copied verbatim, unframed");
+    await app.finish();
+  },
+);
+
+test(
+  "/copy takes the source, not the output the answer ends with",
+  { skip: process.platform === "win32" ? "needs a POSIX shell" : false },
+  async (t: TestContext) => {
+    // The shape that made this a bug: code first, then what it printed.
+    const python = "实现：\n\n```python\nprint(sorted(xs))\n```\n\n输出：\n\n```text\n[1, 2, 3]\n```\n";
+    const cpp = "实现：\n\n```cpp\nint main() { return 0; }\n```\n\n运行示例输出：\n\n```\n3 9 21\n```\n";
+    // Keyed off the question, not a counter: the balance poll shares this
+    // server and would consume the first reply.
+    const baseUrl = await startMockApi(t, {
+      replyFor: (body) => (JSON.stringify(body.messages ?? []).includes("cpp") ? cpp : python),
+    });
+    const app = await harness(t, { config: { baseUrl } });
+    const sink = join(app.home, "clipboard.txt");
+    const script = join(app.home, "fake-copy");
+    await writeFile(script, `#!/bin/sh\ncat > ${JSON.stringify(sink)}\n`, { mode: 0o755 });
+    process.env.DEEPSEEK_TUI_CLIPBOARD = script;
+    t.after(() => {
+      delete process.env.DEEPSEEK_TUI_CLIPBOARD;
+    });
+
+    await app.start();
+    await app.send("写个排序", 500);
+    const copied = await app.send("/copy", 400);
+    assert.match(copied, /已复制 \[1\] python/u, "the last block is the output, which is never what /copy meant");
+    assert.match(copied, /同一条回答还有 \[2\] text/u, "and the other block is named, in case the guess was wrong");
+    assert.equal(await readFile(sink, "utf8"), "print(sorted(xs))");
+
+    // A second implementation question: its own blocks, and its output block
+    // left untagged — the shape that made /copy pick the output again.
+    await app.send("再用 cpp 写一个", 500);
+    const again = await app.send("/copy", 400);
+    assert.match(again, /已复制 \[3\] cpp/u, "the newest answer's source, not its untagged output");
+    assert.match(again, /同一条回答还有 \[4\]/u);
+    assert.equal(await readFile(sink, "utf8"), "int main() { return 0; }");
+
+    // An explicit number still wins, and then nothing is guessed at.
+    const second = await app.send("/copy 2", 400);
+    assert.match(second, /已复制 \[2\] text/u);
+    assert.doesNotMatch(second, /同一条回答还有/u);
+    assert.equal(await readFile(sink, "utf8"), "[1, 2, 3]");
+    await app.finish();
+  },
+);
+
+test("an edited attachment comes back as a diff, and /save can write it out", async (t: TestContext) => {
+  const baseUrl = await startMockApi(t, { content: ["改好了：\n\n```python\ndef f():\n    return 2\n```\n"] });
+  const app = await harness(t, { config: { baseUrl } });
+  const file = join(app.home, "f.py");
+  await writeFile(file, "def f():\n    return 1\n");
+  await app.start();
+
+  const turn = await app.send(`/attach ${file}`, 600);
+  assert.match(turn, /代码块 \[1\] 相对 .*f\.py/u, "an edited attachment is pointed out, not left to be spotted");
+
+  const diff = await app.send("/diff", 300);
+  assert.match(diff, /-\s+return 1/u);
+  assert.match(diff, /\+\s+return 2/u);
+
+  const save = await app.send(`/save 1 ${file}`, 250);
+  assert.match(save, /已存在，将被覆盖/u, "an existing file is never overwritten silently");
+  await app.send("y", 350);
+  assert.equal(await readFile(file, "utf8"), "def f():\n    return 2\n");
+  await app.finish();
+});
+
+test("the attachment diff hint belongs to the turn that produced it", async (t: TestContext) => {
+  const rewrite = "改好了：\n\n```python\ndef f():\n    return 2\n```\n";
+  const baseUrl = await startMockApi(t, {
+    replyFor: (body) => (JSON.stringify(body.messages ?? []).includes("无关") ? "和文件没关系的一段话。" : rewrite),
+  });
+  const app = await harness(t, { config: { baseUrl } });
+  const file = join(app.home, "f.py");
+  await writeFile(file, "def f():\n    return 1\n");
+  await app.start();
+
+  assert.match(await app.send(`/attach ${file}`, 600), /代码块 \[1\] 相对/u);
+  const unrelated = await app.send("说点无关的", 500);
+  assert.doesNotMatch(
+    unrelated,
+    /代码块 \[1\] 相对/u,
+    "an answer with no code of its own has not just rewritten that file",
+  );
   await app.finish();
 });
 
@@ -587,6 +826,103 @@ test("/race runs each effort, compares them, and keeps only the chosen answer", 
   );
 });
 
+/** Three judged races of the same shape: enough for `/effort auto` to act. */
+function seededLedger(winner: string): string {
+  return [1, 2, 3]
+    .map((index) =>
+      JSON.stringify({
+        version: 1,
+        at: `2026-09-0${index}T00:00:00.000Z`,
+        kind: "code",
+        size: "small",
+        branches: [
+          { model: "deepseek-v4-flash", effort: "low", ms: 900, outputTokens: 80, reasoningTokens: 0, cost: 0.0002 },
+          { model: "deepseek-v4-flash", effort: "max", ms: 9_000, outputTokens: 900, reasoningTokens: 4_000, cost: 0.004 },
+        ].map((branch) => (branch.effort === winner ? { ...branch, chosen: true } : branch)),
+      }),
+    )
+    .join("\n");
+}
+
+test("a kept branch is filed in the ledger, and /race stats reads it back", async (t: TestContext) => {
+  const baseUrl = await startMockApi(t, { replyFor: (body) => `这是 ${body.reasoning_effort ?? "?"} 档的回答` });
+  const app = await harness(t, { config: { baseUrl } });
+  await app.start();
+
+  app.reset();
+  app.input.write("/race low max 写个函数把它拍平\n");
+  await until(() => app.plain().includes("保留哪一个"), "both branches should finish");
+  app.input.write("\r");
+  await until(() => app.plain().includes("已记入对比账本"), "the pick should be recorded");
+  assert.match(app.plain(), /写代码/u, "the ledger says what kind of question it judged");
+
+  const stats = await app.send("/race stats", 250);
+  assert.match(stats, /对比账本 · 1 次/u);
+  assert.match(stats, /写代码/u);
+  assert.match(stats, /1\/1/u, "the kept branch counts as a win");
+  await app.finish();
+
+  const ledger = await readFile(join(app.home, "races.jsonl"), "utf8");
+  const filed = JSON.parse(ledger.trim()) as { kind: string; branches: { effort: string; chosen?: boolean }[] };
+  assert.equal(filed.kind, "code");
+  assert.deepEqual(
+    filed.branches.filter((branch) => branch.chosen).map((branch) => branch.effort),
+    ["low"],
+    "only the branch the user kept is marked as the winner",
+  );
+});
+
+test("/race --blind hides which branch is which until the pick is made", async (t: TestContext) => {
+  const baseUrl = await startMockApi(t, { replyFor: (body) => `这是 ${body.reasoning_effort ?? "?"} 档的回答` });
+  const app = await harness(t, { config: { baseUrl } });
+  await app.start();
+
+  app.reset();
+  app.input.write("/race --blind low max 该怎么做\n");
+  await until(() => app.plain().includes("保留哪一个"), "both branches should finish");
+  const compared = app.plain();
+  assert.match(compared, /盲测/u);
+  assert.match(compared, /^\s+A\s/mu, "branches are shown as letters, not levels");
+  assert.match(compared, /^\s+B\s/mu);
+  assert.doesNotMatch(compared.split("保留哪一个")[0] ?? "", /^\s+(?:low|max)\s/mu, "no level labels before the pick");
+
+  app.input.write("\r");
+  // Not "揭晓": the blind header already promises one, so it would match at once.
+  await until(() => app.plain().includes("已保留"), "the pick should be kept");
+  assert.match(app.plain(), /揭晓：[AB] = (?:low|max)/u);
+  await app.finish();
+});
+
+test("/effort auto picks the level the ledger says wins, and says why", async (t: TestContext) => {
+  const capture: MockBody[] = [];
+  const baseUrl = await startMockApi(t, { content: ["好"], capture });
+  // Configured for max: the point of the ledger is to talk you down from it.
+  const app = await harness(t, { config: { baseUrl, effortAuto: true, effort: "max" } });
+  await writeFile(join(app.home, "races.jsonl"), `${seededLedger("low")}\n`);
+  await app.start();
+
+  const status = await app.send("/status", 250);
+  assert.match(status, /思考\s+auto/u, "/status says the level is being chosen automatically");
+
+  const turn = await app.send("写个函数把它拍平", 500);
+  assert.match(turn, /自动选档：写代码问题你对比过 3 次，low 赢了 3 次/u);
+  assert.match(turn, /省 ≈/u, "the cheaper level reports what it saves against the configured one");
+  assert.equal(capture[0]?.reasoning_effort, "low", "the advised level is what gets sent");
+  await app.finish();
+});
+
+test("/effort auto keeps the configured level when the ledger has nothing to say", async (t: TestContext) => {
+  const capture: MockBody[] = [];
+  const baseUrl = await startMockApi(t, { content: ["好"], capture });
+  const app = await harness(t, { config: { baseUrl, effortAuto: true, effort: "max" } });
+  await app.start();
+
+  const turn = await app.send("写个函数把它拍平", 500);
+  assert.match(turn, /自动选档暂无依据/u);
+  assert.equal(capture[0]?.reasoning_effort, "max");
+  await app.finish();
+});
+
 test("/race needs at least two efforts and a question", async (t: TestContext) => {
   const app = await harness(t);
   await app.start();
@@ -650,7 +986,7 @@ test("/do confirms first, then folds the agent's result into the conversation", 
   const done = app.plain();
   assert.match(done, /◆ DSH/);
   assert.match(done, /改了 2 个文件/);
-  assert.match(done, /┌─ diff/, "agent output is rendered as markdown too");
+  assert.match(done, /┌─ \[1\] diff/, "agent output is rendered as markdown too");
 
   // The earlier conversation is handed over so the agent is not starting blind.
   assert.match(StubDsh.lastTask, /此前的对话背景/);

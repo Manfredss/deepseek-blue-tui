@@ -79,6 +79,17 @@ DeepSeek 的[多轮对话指南](https://api-docs.deepseek.com/guides/multi_roun
 
 实现还会保存 assistant 的 `reasoning_content`，并在后续请求中回传；当前[官方 Thinking Mode 文档](https://api-docs.deepseek.com/guides/thinking_mode)说明无工具调用时该字段会被忽略，而工具调用链要求完整回传。显示与保存是两个概念：`/thinking` 只决定终端是否展示思考过程，隐藏时仍可能被 API 返回并保存在会话中。
 
+### 前缀续写（Chat Prefix Completion，Beta）
+
+官方 [Chat Prefix Completion 文档](https://api-docs.deepseek.com/guides/chat_prefix_completion)说明：把最后一条消息设为 `role: "assistant"` 并带 `prefix: true`，模型会**接着写完**这条消息；该能力只在 `https://api.deepseek.com/beta` 提供，并可配合 `stop` 控制结束位置（官方示例即 `prefix: "```python\n"` + `stop: ["```"]`）。
+
+这正好补上本项目两个原本只能靠重问解决的场景：
+
+- `/continue`：被中断的回答已经保存在会话里，重问要把整个思考过程再付一次；前缀续写让后半段只花后半段的钱
+- `/prefill`：强制回答的开头，`/prefill ```python` 等价于「只要代码」
+
+实现上只重写官方 Endpoint 的 base URL（追加 `/beta`，已经是 `/beta` 则不重复）。自定义 OpenAI-compatible 网关按原样发送——凭空拼一个它没有的 `/beta` 只会把可用地址变成 404，而真正代理了该能力的网关本来就在原路径上接受它。
+
 ### 思考强度（reasoning_effort）
 
 [官方 Thinking Mode 指南](https://api-docs.deepseek.com/guides/thinking_mode)确认 DeepSeek V4（flash 与 pro 相同）在 OpenAI 格式下支持：
@@ -187,7 +198,7 @@ DeepSeek API 的调用凭据是 API Key。本项目提供两条真实路径：�
 
 ## 已知差距与后续优先级
 
-这些不是已承诺功能，而是调研后最有价值的改进顺序（v0.1 已落地文件锁、上下文估算预警/裁剪、bracketed paste、DSH 显式安装与日志轮转脱敏，故从清单中移除）：
+这些不是已承诺功能，而是调研后最有价值的改进顺序（v0.1 已落地文件锁、上下文估算预警/裁剪、bracketed paste、DSH 显式安装与日志轮转脱敏；未发布版本已落地前缀续写 `/continue` `/prefill`、`/race` 判定账本与 `/effort auto`、代码块 `/copy` `/save` `/diff`，故从清单中移除）：
 
 1. 系统钥匙串适配与明确的数据删除命令（导出已有 `/export`，删除仍未提供）
 2. 模型级上下文压缩：现有实现是启发式估算 + 超限裁剪 + `/compact` 手动摘要，不是自动压缩
@@ -197,7 +208,17 @@ DeepSeek API 的调用凭据是 API Key。本项目提供两条真实路径：�
 6. DSH 版本兼容矩阵和更明确的 stale state 修复入口（日志轮转与脱敏已完成）
 7. 借鉴 dsh-TUI 但暂未采纳的能力：会话浏览器式 `/resume`、主题、界面语言切换、消息选择模式、输入历史搜索（Ctrl+R 等价物）
 
-若未来加入文件或命令工具，必须先设计 workspace 边界、逐项审批、审计日志、超时、输出上限和跨平台 sandbox，不能仅把 shell 接到模型输出上。
+若未来加入文件或命令工具，必须先设计 workspace 边界、逐项审批、审计日志、超时、输出上限和跨平台 sandbox，不能仅把 shell 接到模型输出上。`/save` 不属于这一类：它由用户显式给出路径、覆盖前确认，模型无法发起，权限面因此没有扩大。
+
+### `/race` 账本：这个客户端独有的一份数据
+
+`/race` 每次都以「你保留哪一个」结束，那一次判定就是一条带标签的样本——「这类问题上，这个档位值不值它的价钱」。据调研，同类客户端要么不做多档对比，要么不精确计价，因此没有一个处在能积累这份数据的位置上。
+
+设计取舍：
+
+- **只记判定，不记内容**：账本里没有问题原文，只有本地判定出的类型（排错/写代码/设计取舍/改写翻译/解释概念）、规模和各分支的耗时、token、花费
+- **宁可没有建议，也不猜**：同类样本少于 3 次、或某档位只出现过 1 次，就沿用配置档位并说明「暂无依据」；胜率相同时选便宜的那档
+- **可反驳**：分类与依据每次都打印出来，`/race stats` 可以随时查账；分类本身是关键词判断，不做语义理解，也就不假装准确
 
 ## 主要资料链接
 
@@ -205,6 +226,7 @@ DeepSeek API 的调用凭据是 API Key。本项目提供两条真实路径：�
 - [DeepSeek API：Create Chat Completion](https://api-docs.deepseek.com/api/create-chat-completion)
 - [DeepSeek API：Multi-round Conversation](https://api-docs.deepseek.com/guides/multi_round_chat)
 - [DeepSeek API：Thinking Mode](https://api-docs.deepseek.com/guides/thinking_mode)
+- [DeepSeek API：Chat Prefix Completion（Beta）](https://api-docs.deepseek.com/guides/chat_prefix_completion)
 - [DeepSeek API：Get User Balance](https://api-docs.deepseek.com/api/get-user-balance/)
 - [DeepSeek API：Models & Pricing](https://api-docs.deepseek.com/quick_start/pricing)
 - [DeepSeek API：Integrate with AI Tools](https://api-docs.deepseek.com/guides/coding_agents)

@@ -1,4 +1,4 @@
-import type { Theme } from "./theme.js";
+import { createTheme, type Theme } from "./theme.js";
 
 /**
  * Streaming Markdown renderer for assistant output.
@@ -227,6 +227,22 @@ export interface MarkdownStreamOptions {
   theme: Theme;
   /** Prefix drawn down the left of a fenced code block. */
   gutter?: string;
+  /**
+   * Number code blocks from here and show the number in the frame, so the
+   * reader can say which one they mean (`/copy 2`). Left out, blocks are still
+   * collected but drawn unnumbered.
+   */
+  numberFrom?: number;
+}
+
+/** A fenced block, kept verbatim so it can be copied or written to a file. */
+export interface CodeBlock {
+  /** 1-based label as drawn in the frame header. */
+  index: number;
+  language: string;
+  code: string;
+  /** The last line of prose before the fence — often "运行示例输出：". */
+  intro?: string;
 }
 
 /**
@@ -242,6 +258,12 @@ const UNDECIDED = /^\s*(?:#{1,6}|[-*+_]+|\d{1,3}[.)]?|`{1,2}|~{1,2}|>)?\s*$/u;
 export class MarkdownStream {
   private readonly theme: Theme;
   private readonly gutter: string;
+  private readonly numberFrom: number | undefined;
+  private readonly collected: CodeBlock[] = [];
+  /** The fence being read, collected line by line so nothing is re-parsed. */
+  private open: { index: number; language: string; lines: string[]; intro: string } | undefined;
+  /** Last line of prose seen outside a fence; what introduces the next block. */
+  private lastProse = "";
   /** The current line so far, including anything already emitted. */
   private line = "";
   /** How much of `line` has been written out. */
@@ -255,11 +277,29 @@ export class MarkdownStream {
   constructor(options: MarkdownStreamOptions) {
     this.theme = options.theme;
     this.gutter = options.gutter ?? "│ ";
+    if (options.numberFrom !== undefined) this.numberFrom = options.numberFrom;
   }
 
   /** True while the renderer is inside a fenced code block. */
   get insideCode(): boolean {
     return this.inFence;
+  }
+
+  /** Every fenced block rendered so far, verbatim. Complete after `end()`. */
+  get blocks(): readonly CodeBlock[] {
+    return this.collected;
+  }
+
+  /** Files the fence that just closed (or that `end()` had to close). */
+  private closeBlock(): void {
+    if (!this.open) return;
+    this.collected.push({
+      index: this.open.index,
+      language: this.open.language,
+      code: this.open.lines.join("\n"),
+      ...(this.open.intro ? { intro: this.open.intro } : {}),
+    });
+    this.open = undefined;
   }
 
   write(delta: string): string {
@@ -270,7 +310,11 @@ export class MarkdownStream {
       if (newline < 0) break;
       this.line += pending.slice(0, newline);
       pending = pending.slice(newline + 1);
+      const completed = this.line;
       out += `${this.finishLine()}\n`;
+      // Remember what introduced the next fence. `finishLine` has already
+      // flipped `inFence`, so a fence line itself is excluded by the test.
+      if (!this.inFence && completed.trim() && !FENCE.test(completed)) this.lastProse = completed.trim();
       this.resetLine();
     }
     this.line += pending;
@@ -290,6 +334,7 @@ export class MarkdownStream {
       this.inFence = false;
       this.fenceMarker = "";
       this.codeState = { blockComment: false };
+      this.closeBlock();
     }
     return out;
   }
@@ -366,18 +411,26 @@ export class MarkdownStream {
         this.fenceMarker = fence[2][0] ?? "`";
         this.codeState = { blockComment: false };
         const language = fence[3] ?? "";
-        return this.theme.muted(`┌─ ${language || "code"} ${"─".repeat(Math.max(0, 12 - language.length))}`);
+        const index = (this.numberFrom ?? 1) + this.collected.length;
+        this.open = { index, language, lines: [], intro: this.lastProse };
+        // Spent: two fences in a row, with nothing but blank lines between
+        // them, must not both claim the one line of prose above the first.
+        this.lastProse = "";
+        const label = this.numberFrom === undefined ? "" : `[${index}] `;
+        return this.theme.muted(`┌─ ${label}${language || "code"} ${"─".repeat(Math.max(0, 12 - language.length))}`);
       }
       // A closing fence must use the same character as the opening one.
       if (fence[2][0] === this.fenceMarker) {
         this.inFence = false;
         this.fenceMarker = "";
         this.codeState = { blockComment: false };
+        this.closeBlock();
         return this.theme.muted("└─");
       }
     }
 
     if (this.inFence) {
+      this.open?.lines.push(line);
       return `${this.theme.muted(this.gutter)}${tintCode(line, this.theme, this.codeState)}`;
     }
 
@@ -410,8 +463,87 @@ export class MarkdownStream {
   }
 }
 
+/** One-shot rendering that also hands back the code blocks it framed. */
+export function renderMarkdownWithBlocks(
+  text: string,
+  theme: Theme,
+  numberFrom?: number,
+): { text: string; blocks: readonly CodeBlock[] } {
+  const stream = new MarkdownStream({ theme, ...(numberFrom === undefined ? {} : { numberFrom }) });
+  const rendered = `${stream.write(text)}${stream.end()}`.replace(/\n+$/u, "");
+  return { text: rendered, blocks: stream.blocks };
+}
+
 /** One-shot rendering for text that is already complete (history replay). */
 export function renderMarkdown(text: string, theme: Theme): string {
-  const stream = new MarkdownStream({ theme });
-  return `${stream.write(text)}${stream.end()}`.replace(/\n+$/u, "");
+  return renderMarkdownWithBlocks(text, theme).text;
+}
+
+/**
+ * Language tags that mean "this is what it printed" rather than "this is the
+ * source". An answer very often ends with its own output, which makes the
+ * *last* block the one nobody wants to copy.
+ */
+const OUTPUT_LANGUAGES = new Set([
+  "text",
+  "txt",
+  "plain",
+  "plaintext",
+  "output",
+  "out",
+  "stdout",
+  "stderr",
+  "console",
+  "terminal",
+  "log",
+  "result",
+]);
+
+/** Prose that announces the block below it is what the program printed. */
+const OUTPUT_INTRO = /输出|结果|运行|示例|打印|效果|\boutput\b|\bresult\b|\bprints?\b|\bconsole\b/iu;
+
+/**
+ * Marks of source rather than printed text. Deliberately shallow: statement
+ * punctuation, indentation, and the keywords every language family shares.
+ */
+const SOURCE_MARKS: readonly RegExp[] = [
+  /[;{}]\s*$/mu,
+  /^\s{2,}\S/mu,
+  /^\s*(?:#\s*include\b|#!)/mu,
+  /\b(?:def|class|import|from|return|function|const|let|var|public|private|void|struct|impl|fn|package|using|namespace|async|await|lambda|echo|git|npm|pip|sudo|cd)\b/u,
+  /=>|->|::|==|!=|\+=|&&|\|\||\$\(/u,
+  /\w+\s*\([^)]*\)\s*[:{]/u,
+];
+
+function looksLikeSource(code: string): boolean {
+  return SOURCE_MARKS.some((mark) => mark.test(code));
+}
+
+/**
+ * Whether a block is the answer's output rather than its source.
+ *
+ * The language tag settles it when there is one. Models routinely leave the
+ * output block untagged, though, so an untagged block is judged by the prose
+ * that introduced it and then by whether it reads like code at all — an
+ * untagged block that looks like source stays source, because a bare shell
+ * command is exactly the kind of thing people copy.
+ */
+export function isOutputBlock(block: CodeBlock): boolean {
+  const language = block.language.trim().toLowerCase();
+  if (language) return OUTPUT_LANGUAGES.has(language);
+  if (block.intro && OUTPUT_INTRO.test(block.intro)) return true;
+  return !looksLikeSource(block.code);
+}
+
+/**
+ * The code blocks in some text, without drawing anything — used to rebuild the
+ * numbering for a session that was resumed rather than streamed. It runs the
+ * same renderer so a block is whatever the frame would have framed, not
+ * whatever a second fence parser happens to think.
+ */
+export function extractCodeBlocks(text: string, numberFrom = 1): CodeBlock[] {
+  const stream = new MarkdownStream({ theme: createTheme(false), numberFrom });
+  stream.write(text);
+  stream.end();
+  return [...stream.blocks];
 }
